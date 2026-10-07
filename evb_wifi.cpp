@@ -18,6 +18,7 @@
 #include <Preferences.h>
 #include <WiFi.h>
 #include <esp_ota_ops.h>
+#include <esp_heap_caps.h>
 #include <esp_sntp.h>
 
 namespace {
@@ -55,6 +56,9 @@ struct WifiTask {
     float latitude;
     float longitude;
     String update_url;
+    bool save_network_when_joined;
+    char joining_ssid[33];
+    char joining_password[65];
 };
 
 WifiTask wifi;
@@ -99,10 +103,15 @@ void join(const char *ssid, const char *password)
     evb_phone_state_end_edit();
 }
 
+/* Writing flash pauses PSRAM, which shakes the screen, so it is written only when it changed. */
 void save_network(const char *ssid, const char *password)
 {
     Preferences preferences;
     preferences.begin("evb-wifi", false);
+    if (preferences.getString("ssid", "") == ssid && preferences.getString("password", "") == password) {
+        preferences.end();
+        return;
+    }
     preferences.putString("ssid", ssid);
     preferences.putString("password", password);
     preferences.end();
@@ -116,6 +125,7 @@ void forget_network(void)
     preferences.end();
     WiFi.disconnect(false, true);
     wifi.joining = false;
+    wifi.save_network_when_joined = false;
     PhoneState *state = evb_phone_state_begin_edit();
     state->wifi_status = WifiStatus::NoNetworkSaved;
     state->wifi_ssid[0] = '\0';
@@ -427,6 +437,13 @@ void follow_connection(uint32_t now_ms)
         evb_copy_text(state->wifi_ip, sizeof(state->wifi_ip), WiFi.localIP().toString().c_str());
         state->wifi_rssi = WiFi.RSSI();
         evb_phone_state_end_edit();
+        if (wifi.save_network_when_joined) {
+            wifi.save_network_when_joined = false;
+            save_network(wifi.joining_ssid, wifi.joining_password);
+        }
+        Serial.printf("Wi-Fi joined %s, IP %s. Internal RAM free %u bytes, largest block %u bytes\n", WiFi.SSID().c_str(),
+                      WiFi.localIP().toString().c_str(), (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+                      (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
         if (!wifi.internet_services_started) {
             start_internet_services();
         }
@@ -438,6 +455,7 @@ void follow_connection(uint32_t now_ms)
 
     if (wifi.joining && !connected && now_ms - wifi.join_started_ms > CONNECT_TIMEOUT_MS) {
         wifi.joining = false;
+        wifi.save_network_when_joined = false;
         set_status(WifiStatus::Failed);
     }
     if (connected && (int32_t)(now_ms - wifi.next_signal_ms) >= 0) {
@@ -456,8 +474,9 @@ void handle(const Request &request)
         break;
     case RequestType::Connect:
         join(request.ssid, request.password);
-        /* Saved now; WiFi keeps retrying it, and Forget removes it. */
-        save_network(request.ssid, request.password);
+        wifi.save_network_when_joined = true;
+        evb_copy_text(wifi.joining_ssid, sizeof(wifi.joining_ssid), request.ssid);
+        evb_copy_text(wifi.joining_password, sizeof(wifi.joining_password), request.password);
         break;
     case RequestType::Forget:
         forget_network();
@@ -474,6 +493,8 @@ void handle(const Request &request)
 void run_wifi_task(void *arg)
 {
     (void)arg;
+    /* Saved by this file in "evb-wifi"; stops the Wi-Fi driver writing flash on every join. */
+    WiFi.persistent(false);
     WiFi.mode(WIFI_STA);
     WiFi.setHostname(EVB_NETWORK_UPLOAD_HOSTNAME);
     WiFi.setAutoReconnect(true);

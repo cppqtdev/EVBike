@@ -280,7 +280,8 @@ def build_pictures(t):
         t.a8(name.upper(), alpha_of(p, squashed_width(p)))
     t.a8('MAP_PIN', alpha_of('design/map_pin.png'))
     t.picture('MAP_CURSOR', rgba_of('design/map_cursor.png'))
-    t.a8('DOCK_TILE', alpha_of('cluster/tile_slant.png'))
+    t.a8('DOCK_BAND', alpha_of('cluster/band_right.png', squashed_width('cluster/band_right.png')))
+    t.a8('DOCK_BAND_LIP', alpha_of('cluster/band_right_lip.png', squashed_width('cluster/band_right_lip.png')))
     t.a8('DOCK_TILE_NARROW', alpha_of('cluster/tile_slant.png', 66))
     for turn in ('straight', 'slight_left', 'left', 'sharp_left', 'slight_right', 'right', 'sharp_right', 'uturn_left',
                  'uturn_right', 'roundabout', 'roundabout_exit', 'fork_left', 'fork_right', 'merge_left', 'merge_right',

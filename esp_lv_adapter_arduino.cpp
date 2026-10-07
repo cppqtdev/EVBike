@@ -176,7 +176,8 @@ lv_display_t *esp_lv_adapter_register_display(const esp_lv_adapter_display_confi
         s_ctx.buf2 = s_ctx.lcd->getFrameBufferByIndex(1);
         if ((s_ctx.buf1 != nullptr) && (s_ctx.buf2 != nullptr)) {
             buffer_bytes = width * height * sizeof(lv_color_t);
-            render_mode = LV_DISPLAY_RENDER_MODE_FULL;
+            /* Only changed areas are drawn and copied to the other frame, which leaves PSRAM free for the screen scan-out. */
+            render_mode = LV_DISPLAY_RENDER_MODE_DIRECT;
             s_ctx.rgb_full_refresh = true;
         }
     }

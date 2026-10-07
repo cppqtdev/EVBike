@@ -140,7 +140,7 @@ struct RideScreen {
     lv_obj_t *mode_glow;
     lv_obj_t *mode_label;
     lv_obj_t *alerts_icon;
-    lv_obj_t *settings_tile;
+    lv_obj_t *settings_band;
     lv_obj_t *settings_icon;
     lv_obj_t *navigation_tile;
     lv_obj_t *navigation_icon;
@@ -347,8 +347,11 @@ void build_dock(lv_obj_t *parent)
 
     screen.alerts_icon = add_tinted_picture(parent, EVB_ASSET_ICON_BELL, 478 - 12, DOCK_TOP + 13, color::text_slate);
 
-    screen.settings_tile = add_tinted_picture(parent, EVB_ASSET_DOCK_TILE, SETTINGS_ICON_X + 12 - 47, DOCK_TOP + 3, color::surface_selected);
-    set_shown(screen.settings_tile, false);
+    /* Same as the reference dock: the band follows the frame's slanted edge. */
+    screen.settings_band = add_full_screen_layer(parent);
+    add_tinted_picture(screen.settings_band, EVB_ASSET_DOCK_BAND, panel_x_of_design_x(770), DOCK_TOP + 10, lv_color_hex(0x020202));
+    add_tinted_picture(screen.settings_band, EVB_ASSET_DOCK_BAND_LIP, panel_x_of_design_x(770), DOCK_TOP + 10, color::neutral3a);
+    set_shown(screen.settings_band, false);
     screen.settings_icon = add_tinted_picture(parent, EVB_ASSET_ICON_SETTINGS, SETTINGS_ICON_X, DOCK_TOP + 13, color::text_slate);
 
     add_dock_touch_area(parent, mode_center_x, 110, screen.handlers.on_ride_mode_tapped);
@@ -712,7 +715,7 @@ void evb_ride_screen_show_state(const evb_vehicle_state_t *vehicle, const evb_cl
 void evb_ride_screen_show_menu_open(bool menu_open)
 {
     set_shown(screen.ride_view, !menu_open);
-    set_shown(screen.settings_tile, menu_open);
+    set_shown(screen.settings_band, menu_open);
     tint_picture(screen.settings_icon, menu_open ? color::text_primary : color::text_slate);
 }
 

@@ -403,6 +403,9 @@ void run_step(Step step, uint32_t generation)
         return subscribe(found.cts_current_time_config, generation);
     case Step::Done:
         publish_link_kind();
+        Serial.printf("Phone ready. Notifications (ANCS): %s, music (AMS): %s, time (CTS): %s\n",
+                      found.ancs_notification_source_config != 0 ? "yes" : "no",
+                      found.ams_remote_command != 0 ? "yes" : "no", found.cts_current_time != 0 ? "yes" : "no");
         return;
     }
     if (rc != 0) {
@@ -457,6 +460,7 @@ void on_notification(uint16_t attribute, os_mbuf *om)
     const PhoneServices &found = phone.services;
     if (attribute == found.ancs_notification_source) {
         AncsRequest request;
+        Serial.printf("Phone notification: event %u, category %u\n", length > 0 ? data[0] : 0, length > 2 ? data[2] : 0);
         if (ancs_on_notification_source(data, length, now_ms, &request)) {
             queue_ancs_request(request, now_ms);
         }

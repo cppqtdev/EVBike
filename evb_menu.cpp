@@ -60,6 +60,7 @@ struct Menu {
     const PhoneState *phone;
     uint32_t now_ms;
     uint32_t shown_phone_revision;
+    uint32_t shown_page_data_fingerprint;
     uint32_t phone_rebuild_elapsed_ms;
 
     lv_obj_t *keyboard_layer;
@@ -101,6 +102,7 @@ struct LiveLabels {
 LiveLabels live;
 
 void rebuild_page(void);
+uint32_t fingerprint_of_phone_data_on_open_page(void);
 
 /* ---------- shared page parts ---------- */
 
@@ -953,10 +955,15 @@ void on_wifi_network_tapped(lv_event_t *event)
     }
 }
 
+int signal_bars_of_rssi(int rssi)
+{
+    return rssi >= -55 ? 4 : (rssi >= -65 ? 3 : (rssi >= -75 ? 2 : 1));
+}
+
 /* Four signal bars from the RSSI, like a phone's status bar. */
 void add_signal_bars(lv_obj_t *parent, int x, int y, int rssi)
 {
-    int bars = rssi >= -55 ? 4 : (rssi >= -65 ? 3 : (rssi >= -75 ? 2 : 1));
+    int bars = signal_bars_of_rssi(rssi);
     for (int i = 0; i < 4; i++) {
         int height = 4 + i * 3;
         add_color_block(parent, x + i * 5, y + 13 - height, 3, height, i < bars ? color::text_primary : color::stroke, LV_OPA_COVER, 1);
@@ -1235,6 +1242,7 @@ void rebuild_page(void)
     menu.page = add_full_screen_layer(menu.page_host);
     lv_obj_set_height(menu.page, CAROUSEL_TOP);
     PAGE_BUILDERS[menu.page_index](menu.page);
+    menu.shown_page_data_fingerprint = fingerprint_of_phone_data_on_open_page();
 }
 
 void move_menu(int step)
@@ -1363,6 +1371,106 @@ bool page_shows_phone_data(int page_index)
     return page_index == PAGE_MISC || page_index == PAGE_CONNECTIVITY || page_index == PAGE_WIFI || page_index == PAGE_SYSTEM;
 }
 
+namespace {
+
+/* FNV-1a hash, used to notice when the data a page shows has really changed. */
+struct Fingerprint {
+    uint32_t value = 2166136261u;
+
+    void add_bytes(const void *data, size_t size)
+    {
+        const uint8_t *bytes = (const uint8_t *)data;
+        for (size_t i = 0; i < size; i++) {
+            value = (value ^ bytes[i]) * 16777619u;
+        }
+    }
+
+    void add_text(const char *text)
+    {
+        add_bytes(text, strlen(text) + 1);
+    }
+
+    void add_number(int number)
+    {
+        add_bytes(&number, sizeof(number));
+    }
+};
+
+/*
+ * Only what the open page draws: the Wi-Fi signal strength, music position and
+ * other values that change every few seconds are left out, so the page is not
+ * thrown away and drawn again (which flickers) when nothing on it changed.
+ */
+uint32_t fingerprint_of_phone_data_on_open_page(void)
+{
+    const PhoneState *phone = menu.phone;
+    Fingerprint print;
+    print.add_number(menu.page_index);
+    if (menu.page_index == PAGE_MISC) {
+        print.add_number(phone->bluetooth_ready);
+        print.add_number(phone->phone_connected);
+        print.add_number(phone->phone_bonded);
+        print.add_number((int)phone->link_kind);
+        print.add_number(phone->can_dial);
+        print.add_number(phone->media_info_available);
+        print.add_number(phone->media_controls_available);
+        print.add_number(phone->media_playing);
+        print.add_number(phone->media_volume_percent);
+        print.add_number(phone->media_duration_s);
+        print.add_text(phone->media_title);
+        print.add_text(phone->media_artist);
+        for (int i = 0; i < EVB_LIST_SLOTS; i++) {
+            print.add_text(phone->contacts[i].title);
+            print.add_text(phone->contacts[i].text);
+            print.add_text(phone->reminders[i].title);
+            print.add_text(phone->reminders[i].text);
+        }
+        print.add_number((int)phone->wifi_status);
+        print.add_text(phone->wifi_ssid);
+        print.add_text(phone->wifi_ip);
+    } else if (menu.page_index == PAGE_CONNECTIVITY) {
+        print.add_number(phone->bluetooth_ready);
+        print.add_number(phone->phone_connected);
+        print.add_number(phone->phone_bonded);
+        print.add_number((int)phone->link_kind);
+        print.add_number(phone->phone_battery_percent);
+        print.add_number((int)phone->wifi_status);
+        print.add_text(phone->wifi_ssid);
+        print.add_text(phone->wifi_ip);
+    } else if (menu.page_index == PAGE_WIFI) {
+        print.add_number((int)phone->wifi_status);
+        print.add_text(phone->wifi_ssid);
+        print.add_text(phone->wifi_ip);
+        print.add_number(phone->wifi_scanning);
+        print.add_number(phone->wifi_network_count);
+        for (int i = 0; i < phone->wifi_network_count && i < EVB_WIFI_LIST_MAX; i++) {
+            print.add_text(phone->wifi_networks[i].ssid);
+            print.add_number(phone->wifi_networks[i].secured);
+            print.add_number(signal_bars_of_rssi(phone->wifi_networks[i].rssi));
+        }
+    } else if (menu.page_index == PAGE_SYSTEM) {
+        int hours = -1;
+        int minutes = -1;
+        evb_clock_read_local(&hours, &minutes);
+        print.add_number(hours);
+        print.add_number(minutes);
+        print.add_text(phone->clock_source);
+        print.add_number(evb_clock_utc_offset_minutes());
+        print.add_number((int)phone->update_status);
+        print.add_number(phone->update_percent);
+        print.add_text(phone->update_version);
+        print.add_text(phone->update_message);
+        print.add_number(phone->network_upload_ready);
+        print.add_number(phone->weather_valid);
+        print.add_number(phone->weather_temp_c);
+        print.add_text(phone->weather_place);
+        print.add_text(phone->wifi_ip);
+    }
+    return print.value;
+}
+
+} // namespace
+
 void evb_menu_refresh(uint32_t elapsed_ms, uint32_t now_ms)
 {
     menu.now_ms = now_ms;
@@ -1381,7 +1489,11 @@ void evb_menu_refresh(uint32_t elapsed_ms, uint32_t now_ms)
         && menu.phone_rebuild_elapsed_ms >= PHONE_PAGE_REBUILD_MS) {
         menu.phone_rebuild_elapsed_ms = 0;
         menu.shown_phone_revision = menu.phone->revision;
-        rebuild_page();
+        uint32_t fingerprint = fingerprint_of_phone_data_on_open_page();
+        if (fingerprint != menu.shown_page_data_fingerprint) {
+            menu.shown_page_data_fingerprint = fingerprint;
+            rebuild_page();
+        }
     }
 
     menu.refresh_elapsed_ms += elapsed_ms;

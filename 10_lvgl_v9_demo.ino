@@ -39,7 +39,7 @@ void setup()
     auto *lcd_bus = lcd->getBus();
     if (lcd_bus->getBasicAttributes().type == ESP_PANEL_BUS_TYPE_RGB) {
         lcd->configFrameBufferNumber(frame_buffer_count);
-        static_cast<BusRGB *>(lcd_bus)->configRGB_BounceBufferSize(lcd->getFrameWidth() * 10);
+        static_cast<BusRGB *>(lcd_bus)->configRGB_BounceBufferSize(lcd->getFrameWidth() * 20);
     }
 
     assert(board->begin());
