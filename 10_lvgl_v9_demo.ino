@@ -40,6 +40,9 @@ void setup()
     if (lcd_bus->getBasicAttributes().type == ESP_PANEL_BUS_TYPE_RGB) {
         lcd->configFrameBufferNumber(frame_buffer_count);
         static_cast<BusRGB *>(lcd_bus)->configRGB_BounceBufferSize(lcd->getFrameWidth() * 20);
+        /* 14 MHz instead of the board's 16 MHz: the screen reads less from PSRAM, so Wi-Fi and
+           Bluetooth activity no longer make the picture shake (about 33 frames per second). */
+        static_cast<BusRGB *>(lcd_bus)->configRGB_FreqHz(14 * 1000 * 1000);
     }
 
     assert(board->begin());
