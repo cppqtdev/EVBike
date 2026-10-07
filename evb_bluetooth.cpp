@@ -654,7 +654,7 @@ void evb_bluetooth_start(void)
 
     hid = new BLEHIDDevice(server);
     media_keys = hid->inputReport(MEDIA_REPORT_ID);
-    hid->manufacturer("EVBikes");
+    hid->manufacturer()->setValue("EVBikes");
     hid->pnp(0x02, 0x303A, 0x4001, 0x0100);
     hid->hidInfo(0x00, 0x01);
     hid->reportMap((uint8_t *)MEDIA_KEYS_REPORT_MAP, sizeof(MEDIA_KEYS_REPORT_MAP));
