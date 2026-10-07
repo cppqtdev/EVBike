@@ -1,8 +1,14 @@
 #include "evb_cluster_app.h"
 
+#include <string.h>
+
+#include "evb_bluetooth.h"
 #include "evb_boot_screens.h"
+#include "evb_clock.h"
 #include "evb_cluster_settings.h"
 #include "evb_menu.h"
+#include "evb_phone_overlays.h"
+#include "evb_phone_state.h"
 #include "evb_ride_screen.h"
 #include "evb_top_chrome.h"
 #include "evb_ui_kit.h"
@@ -22,6 +28,23 @@ constexpr uint32_t PRE_RIDE_READY_MS = 2500;
 constexpr uint32_t PARKED_FOR_MENU_MS = 8000;
 const bool PROFILE_ENROLLED[EVB_PROFILE_COUNT] = {true, true, false};
 
+/* The EVBikes simulator's demo route, used while Demo mode is on and no phone sends a route. */
+struct DemoRouteStep {
+    uint8_t maneuver;
+    uint16_t distance_m;
+    const char *road;
+};
+
+const DemoRouteStep DEMO_ROUTE[] = {
+    {6, 180, "MG Road"},
+    {1, 300, "Outer Ring Road"},
+    {10, 180, "Silk Board Junction"},
+    {2, 140, "Hosur Road"},
+    {3, 160, "Electronic City Phase 1"},
+    {16, 150, "Office"},
+};
+constexpr int DEMO_ROUTE_LENGTH = sizeof(DEMO_ROUTE) / sizeof(DEMO_ROUTE[0]);
+
 enum class Stage {
     Splash,
     Auth,
@@ -37,6 +60,11 @@ struct ClusterApp {
 
     evb_vehicle_state_t vehicle;
     evb_cluster_settings_t settings;
+    PhoneState phone;
+    bool map_shown;
+
+    int demo_route_step;
+    float demo_route_distance_m;
 
     evb_auth_state_t auth_state;
     uint32_t auth_elapsed_ms;
@@ -102,6 +130,12 @@ void on_alerts_tapped(void)
     app.vehicle.alerts_muted = !app.vehicle.alerts_muted;
 }
 
+void on_navigation_tapped(void)
+{
+    app.map_shown = !app.map_shown;
+    evb_ride_screen_show_map(app.map_shown);
+}
+
 void on_settings_tapped(void)
 {
     if (evb_menu_is_open()) {
@@ -156,9 +190,9 @@ void start_ride(void)
 
     app.stage = Stage::Ride;
     app.stage_elapsed_ms = 0;
-    evb_ride_screen_handlers_t handlers = {on_ride_mode_tapped, on_alerts_tapped, on_settings_tapped};
+    evb_ride_screen_handlers_t handlers = {on_ride_mode_tapped, on_alerts_tapped, on_settings_tapped, on_navigation_tapped};
     evb_ride_screen_create(app.stage_layer, &handlers);
-    evb_menu_create(app.stage_layer, &app.settings, &app.vehicle);
+    evb_menu_create(app.stage_layer, &app.settings, &app.vehicle, &app.phone);
 }
 
 void run_splash(void)
@@ -211,13 +245,40 @@ void run_pre_ride(uint32_t elapsed_ms)
         app.vehicle.side_stand_down = false;
     }
     show_shell(app.vehicle.side_stand_down ? EVB_ASSET_SHELL_PRERIDE_STAND : EVB_ASSET_SHELL_PRERIDE_READY);
-    evb_pre_ride_show(app.vehicle.side_stand_down, app.vehicle.phone_connected);
+    evb_pre_ride_show(app.vehicle.side_stand_down, app.phone.phone_connected);
     if (!app.vehicle.side_stand_down) {
         app.pre_ride_ready_ms += elapsed_ms;
         if (app.pre_ride_ready_ms >= PRE_RIDE_READY_MS) {
             start_ride();
         }
     }
+}
+
+/* Moves along the demo route at the bike's speed. */
+void show_demo_route(uint32_t elapsed_ms)
+{
+    if (!app.settings.demo_running) {
+        return;
+    }
+    app.demo_route_distance_m -= app.vehicle.speed_kmh / 3.6f * elapsed_ms / 1000.0f;
+    if (app.demo_route_distance_m <= 0) {
+        app.demo_route_step = (app.demo_route_step + 1) % DEMO_ROUTE_LENGTH;
+        app.demo_route_distance_m = DEMO_ROUTE[app.demo_route_step].distance_m;
+    }
+    const DemoRouteStep &step = DEMO_ROUTE[app.demo_route_step];
+    uint32_t remaining = (uint32_t)app.demo_route_distance_m;
+    for (int i = app.demo_route_step + 1; i < DEMO_ROUTE_LENGTH; i++) {
+        remaining += DEMO_ROUTE[i].distance_m;
+    }
+    NavState &nav = app.phone.nav;
+    nav.active = true;
+    nav.demo = true;
+    nav.maneuver = step.maneuver;
+    nav.roundabout_exit = step.maneuver == 10 ? 2 : 0;
+    nav.distance_to_maneuver_m = (uint32_t)app.demo_route_distance_m;
+    nav.distance_remaining_m = remaining;
+    nav.eta_minutes = (uint16_t)(remaining / 400 + 1);
+    evb_copy_text(nav.road, sizeof(nav.road), step.road);
 }
 
 void run_ride(uint32_t elapsed_ms)
@@ -228,9 +289,12 @@ void run_ride(uint32_t elapsed_ms)
     }
     bool may_ride = app.settings.demo_running && !evb_menu_is_open() && app.park_request_left_ms == 0;
     evb_vehicle_simulator_step(&app.vehicle, elapsed_ms, may_ride);
+    if (!app.phone.nav.active) {
+        show_demo_route(elapsed_ms);
+    }
     show_shell(app.vehicle.ride_mode == EVB_RIDE_MODE_SPORT ? EVB_ASSET_SHELL_RIDE_SPORT : EVB_ASSET_SHELL_RIDE_ECO);
-    evb_ride_screen_show_state(&app.vehicle, &app.settings);
-    evb_menu_refresh(elapsed_ms);
+    evb_ride_screen_show_state(&app.vehicle, &app.settings, &app.phone.nav, app.phone.phone_connected);
+    evb_menu_refresh(elapsed_ms, lv_tick_get());
 }
 
 void run_cluster(lv_timer_t *timer)
@@ -240,6 +304,8 @@ void run_cluster(lv_timer_t *timer)
     app.last_tick = lv_tick_get();
     app.uptime_ms += elapsed_ms;
     app.stage_elapsed_ms += elapsed_ms;
+    evb_phone_state_read(&app.phone);
+    evb_bluetooth_poll(lv_tick_get());
 
     switch (app.stage) {
     case Stage::Splash:
@@ -255,7 +321,8 @@ void run_cluster(lv_timer_t *timer)
         run_ride(elapsed_ms);
         break;
     }
-    evb_top_chrome_show(&app.vehicle, &app.settings, app.stage == Stage::Ride, app.uptime_ms < SELF_TEST_MS);
+    evb_top_chrome_show(&app.vehicle, &app.settings, &app.phone, app.stage == Stage::Ride, app.uptime_ms < SELF_TEST_MS);
+    evb_phone_overlays_show(&app.phone, app.vehicle.speed_kmh > 0, lv_tick_get());
 }
 
 void load_default_settings(evb_cluster_settings_t *settings)
@@ -275,6 +342,9 @@ void load_default_settings(evb_cluster_settings_t *settings)
 void evb_cluster_app_start(void)
 {
     app = ClusterApp();
+    evb_clock_begin();
+    evb_phone_state_read(&app.phone);
+    app.demo_route_distance_m = DEMO_ROUTE[0].distance_m;
     evb_vehicle_simulator_reset(&app.vehicle);
     load_default_settings(&app.settings);
 
@@ -290,11 +360,12 @@ void evb_cluster_app_start(void)
     lv_obj_set_style_opa(app.floor_glow, LV_OPA_TRANSP, 0);
     app.stage_layer = add_full_screen_layer(root);
     evb_top_chrome_create(root);
+    evb_phone_overlays_create(root);
 
     app.stage = Stage::Splash;
     evb_splash_create(app.stage_layer);
     evb_splash_show_step(0);
-    evb_top_chrome_show(&app.vehicle, &app.settings, false, true);
+    evb_top_chrome_show(&app.vehicle, &app.settings, &app.phone, false, true);
 
     app.last_tick = lv_tick_get();
     lv_timer_create(run_cluster, TICK_MS, NULL);

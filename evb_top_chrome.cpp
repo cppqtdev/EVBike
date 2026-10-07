@@ -1,5 +1,6 @@
 #include "evb_top_chrome.h"
 
+#include "evb_clock.h"
 #include "evb_ui_kit.h"
 
 using namespace evb;
@@ -49,6 +50,7 @@ struct TopChrome {
     int clock_hours;
     int clock_minutes;
     bool use_24_hour;
+    bool clock_valid;
 };
 
 TopChrome chrome;
@@ -83,14 +85,18 @@ void show_ambient_temperature(int ambient_temp_c)
     lv_obj_align_to(chrome.ambient_temp_unit, chrome.ambient_temp_text, LV_ALIGN_OUT_RIGHT_TOP, 5, 7);
 }
 
-void show_clock(int hours, int minutes, bool use_24_hour)
+void show_clock(bool valid, int hours, int minutes, bool use_24_hour)
 {
+    set_shown(chrome.clock_text, valid);
+    set_shown(chrome.clock_meridiem, valid && !use_24_hour);
+    if (!valid) {
+        return;
+    }
     int shown_hours = hours;
     if (!use_24_hour) {
         shown_hours = hours % 12 == 0 ? 12 : hours % 12;
     }
     lv_label_set_text_fmt(chrome.clock_text, "%02d:%02d", shown_hours, minutes);
-    set_shown(chrome.clock_meridiem, !use_24_hour);
     lv_label_set_text(chrome.clock_meridiem, hours < 12 ? "am" : "pm");
     lv_obj_align_to(chrome.clock_meridiem, chrome.clock_text, LV_ALIGN_OUT_RIGHT_TOP, 1, 7);
 }
@@ -126,30 +132,37 @@ void evb_top_chrome_create(lv_obj_t *parent)
     set_shown(chrome.status_corners, false);
 }
 
-void evb_top_chrome_show(const evb_vehicle_state_t *vehicle, const evb_cluster_settings_t *settings, bool riding, bool self_test)
+void evb_top_chrome_show(const evb_vehicle_state_t *vehicle, const evb_cluster_settings_t *settings, const PhoneState *phone,
+                         bool riding, bool self_test)
 {
     bool first = !chrome.has_shown;
+    int hours = 0;
+    int minutes = 0;
+    bool clock_valid = evb_clock_read_local(&hours, &minutes);
+    int ambient_temp_c = phone->weather_valid ? phone->weather_temp_c : vehicle->ambient_temp_c;
+    bool phone_connected = phone->phone_connected;
     show_telltales(vehicle, self_test);
 
     if (first || riding != chrome.riding) {
         set_shown(chrome.status_corners, riding);
     }
-    if (first || vehicle->phone_connected != chrome.phone_connected) {
-        show_phone_link(vehicle->phone_connected);
+    if (first || phone_connected != chrome.phone_connected) {
+        show_phone_link(phone_connected);
     }
-    if (first || vehicle->ambient_temp_c != chrome.ambient_temp_c) {
-        show_ambient_temperature(vehicle->ambient_temp_c);
+    if (first || ambient_temp_c != chrome.ambient_temp_c) {
+        show_ambient_temperature(ambient_temp_c);
     }
-    if (first || vehicle->clock_hours != chrome.clock_hours || vehicle->clock_minutes != chrome.clock_minutes
+    if (first || clock_valid != chrome.clock_valid || hours != chrome.clock_hours || minutes != chrome.clock_minutes
         || settings->use_24_hour != chrome.use_24_hour) {
-        show_clock(vehicle->clock_hours, vehicle->clock_minutes, settings->use_24_hour);
+        show_clock(clock_valid, hours, minutes, settings->use_24_hour);
     }
 
     chrome.has_shown = true;
     chrome.riding = riding;
-    chrome.phone_connected = vehicle->phone_connected;
-    chrome.ambient_temp_c = vehicle->ambient_temp_c;
-    chrome.clock_hours = vehicle->clock_hours;
-    chrome.clock_minutes = vehicle->clock_minutes;
+    chrome.phone_connected = phone_connected;
+    chrome.ambient_temp_c = ambient_temp_c;
+    chrome.clock_valid = clock_valid;
+    chrome.clock_hours = hours;
+    chrome.clock_minutes = minutes;
     chrome.use_24_hour = settings->use_24_hour;
 }

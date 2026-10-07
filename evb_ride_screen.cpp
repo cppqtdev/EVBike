@@ -1,5 +1,8 @@
 #include "evb_ride_screen.h"
 
+#include <stdio.h>
+#include <string.h>
+
 #include "evb_ui_kit.h"
 
 /*
@@ -98,6 +101,7 @@ constexpr int BATTERY_TRACK_X = 244;
 constexpr int TEMP_TRACK_X = 416;
 constexpr int DOCK_TOP = 410;
 constexpr int SETTINGS_ICON_X = 530;
+constexpr int NAVIGATION_ICON_CENTER_X = 324;
 
 const char *const GEAR_LETTERS[GEAR_COUNT] = {"R", "P", "D"};
 const int GEAR_CENTER_X[GEAR_COUNT] = {234, 255, 276};
@@ -136,8 +140,24 @@ struct RideScreen {
     lv_obj_t *mode_glow;
     lv_obj_t *mode_label;
     lv_obj_t *alerts_icon;
-    lv_obj_t *settings_band;
+    lv_obj_t *settings_tile;
     lv_obj_t *settings_icon;
+    lv_obj_t *navigation_tile;
+    lv_obj_t *navigation_icon;
+
+    lv_obj_t *bike_view;
+    lv_obj_t *map_view;
+    lv_obj_t *route_layer;
+    lv_obj_t *no_route_layer;
+    lv_obj_t *no_route_text;
+    lv_obj_t *road_name;
+    lv_obj_t *turn_icon;
+    lv_obj_t *roundabout_badge;
+    lv_obj_t *roundabout_exit;
+    lv_obj_t *turn_distance;
+    NavState shown_nav;
+    bool shown_phone_connected;
+    bool map_shown;
 
     evb_vehicle_state_t shown;
     bool shown_use_miles;
@@ -313,7 +333,10 @@ void build_dock(lv_obj_t *parent)
         place_by_center(screen.gear_labels[i], GEAR_CENTER_X[i], DOCK_TOP + 25);
     }
 
-    add_tinted_picture(parent, EVB_ASSET_ICON_COMPASS, 324 - 18, DOCK_TOP + 13, color::text_cool_muted);
+    /* The selected dock item sits on a dark slanted tile, like the compass in the design. */
+    screen.navigation_tile = add_tinted_picture(parent, EVB_ASSET_DOCK_TILE_NARROW, NAVIGATION_ICON_CENTER_X - 33, DOCK_TOP + 3, color::surface_selected);
+    set_shown(screen.navigation_tile, false);
+    screen.navigation_icon = add_tinted_picture(parent, EVB_ASSET_ICON_COMPASS, NAVIGATION_ICON_CENTER_X - 18, DOCK_TOP + 13, color::text_cool_muted);
 
     screen.mode_glow = add_tinted_picture(parent, EVB_ASSET_MODE_GLOW, mode_center_x - 70, DOCK_TOP - 8,
                                           colors_for_mode(EVB_RIDE_MODE_ECO).accent);
@@ -324,15 +347,109 @@ void build_dock(lv_obj_t *parent)
 
     screen.alerts_icon = add_tinted_picture(parent, EVB_ASSET_ICON_BELL, 478 - 12, DOCK_TOP + 13, color::text_slate);
 
-    screen.settings_band = add_full_screen_layer(parent);
-    add_tinted_picture(screen.settings_band, EVB_ASSET_DOCK_BAND, 490, DOCK_TOP + 10, lv_color_hex(0x020202));
-    add_tinted_picture(screen.settings_band, EVB_ASSET_DOCK_BAND_LIP, 490, DOCK_TOP + 10, color::neutral3a);
-    set_shown(screen.settings_band, false);
+    screen.settings_tile = add_tinted_picture(parent, EVB_ASSET_DOCK_TILE, SETTINGS_ICON_X + 12 - 47, DOCK_TOP + 3, color::surface_selected);
+    set_shown(screen.settings_tile, false);
     screen.settings_icon = add_tinted_picture(parent, EVB_ASSET_ICON_SETTINGS, SETTINGS_ICON_X, DOCK_TOP + 13, color::text_slate);
 
     add_dock_touch_area(parent, mode_center_x, 110, screen.handlers.on_ride_mode_tapped);
     add_dock_touch_area(parent, 478, 56, screen.handlers.on_alerts_tapped);
     add_dock_touch_area(parent, SETTINGS_ICON_X + 12, 60, screen.handlers.on_settings_tapped);
+    add_dock_touch_area(parent, NAVIGATION_ICON_CENTER_X, 60, screen.handlers.on_navigation_tapped);
+}
+
+/* ---------- navigation map (MapView.qml, RouteGuidance.qml) ---------- */
+
+/* Guidance and buttons keep their design size; their design x moves by 240 so the design
+ * centre lands on the panel centre. The terrain and route follow the squashed shell. */
+int guidance_x(int design_x)
+{
+    return design_x - 240;
+}
+
+struct MapShortcut {
+    const char *title;
+    evb_asset_id_t icon;
+};
+
+const MapShortcut MAP_SHORTCUTS[5] = {
+    {"Call mechanic", EVB_ASSET_ICON_WRENCH_18},
+    {"Commute", EVB_ASSET_ICON_BUILDING_18},
+    {"Explore", EVB_ASSET_ICON_PIN_30},
+    {"Charging", EVB_ASSET_ICON_STATION_18},
+    {"Emergency", EVB_ASSET_ICON_TRIANGLE_18},
+};
+
+int map_shortcut_design_x(int index)
+{
+    if (index < 2) {
+        return 494 + index * 52;
+    }
+    if (index == 2) {
+        return 598;
+    }
+    return 674 + (index - 3) * 52;
+}
+
+void build_no_route_hint(lv_obj_t *parent)
+{
+    screen.no_route_layer = add_full_screen_layer(parent);
+    screen.no_route_text = add_text(screen.no_route_layer, &evb_font_regular_16, color::text_secondary, "");
+    place_by_top_center(screen.no_route_text, 400, 110);
+
+    for (int i = 0; i < 5; i++) {
+        bool big = i == 2;
+        int width = big ? 70 : 48;
+        int height = big ? 62 : 48;
+        lv_obj_t *tile = add_color_block(screen.no_route_layer, guidance_x(map_shortcut_design_x(i)), big ? 248 : 262, width, height,
+                                         big ? lv_color_hex(0x323232) : color::neutral20, big ? LV_OPA_COVER : 204, 4);
+        if (big) {
+            add_tinted_picture(tile, MAP_SHORTCUTS[i].icon, (width - 30) / 2, 6, color::white);
+        } else {
+            add_tinted_picture(tile, MAP_SHORTCUTS[i].icon, (width - 18) / 2, 5, color::divider_cool);
+        }
+        lv_obj_t *title = add_text(tile, big ? &evb_font_regular_13 : &evb_font_regular_10, big ? color::white : color::icon_muted,
+                                   MAP_SHORTCUTS[i].title);
+        lv_label_set_long_mode(title, LV_LABEL_LONG_MODE_WRAP);
+        lv_obj_set_width(title, width);
+        lv_obj_set_style_text_align(title, LV_TEXT_ALIGN_CENTER, 0);
+        lv_obj_set_pos(title, 0, big ? 40 : 26);
+    }
+}
+
+void build_route_guidance(lv_obj_t *parent)
+{
+    screen.route_layer = add_full_screen_layer(parent);
+    lv_obj_t *route = screen.route_layer;
+    add_tinted_picture(route, EVB_ASSET_MAP_ROUTE, panel_x_of_design_x(530), 82, color::white);
+    add_tinted_picture(route, EVB_ASSET_MAP_PIN, panel_x_of_design_x(774), 78, color::white);
+
+    add_tinted_picture(route, EVB_ASSET_ICON_FLAG_18, guidance_x(558), 67, color::white);
+    screen.road_name = add_text(route, &evb_font_regular_16, lv_color_hex(0xEAEAEA), "");
+    lv_label_set_long_mode(screen.road_name, LV_LABEL_LONG_MODE_DOTS);
+    lv_obj_set_width(screen.road_name, 150);
+    lv_obj_set_pos(screen.road_name, guidance_x(577), 68);
+    add_color_block(route, guidance_x(563), 89, 160, 1, lv_color_hex(0x939393), LV_OPA_COVER, 0);
+    screen.turn_icon = add_tinted_picture(route, EVB_ASSET_ICON_NAV_28, guidance_x(589), 93, lv_color_hex(0xA4A4A4));
+    screen.roundabout_badge = add_color_block(route, guidance_x(604), 91, 16, 16, color::teal, LV_OPA_COVER, LV_RADIUS_CIRCLE);
+    screen.roundabout_exit = add_text(screen.roundabout_badge, &evb_font_regular_13, color::black, "");
+    lv_obj_center(screen.roundabout_exit);
+    screen.turn_distance = add_text(route, &evb_font_regular_26, lv_color_hex(0xE1E1E1), "");
+    lv_obj_set_pos(screen.turn_distance, guidance_x(619), 91);
+
+    const evb_asset_id_t buttons[3] = {EVB_ASSET_ICON_MIC_18, EVB_ASSET_ICON_TARGET_18, EVB_ASSET_ICON_LAYERS_18};
+    for (int i = 0; i < 3; i++) {
+        lv_obj_t *button = add_color_block(route, panel_x_of_design_x(775) + i * (24 + 17), 67, 24, 24, lv_color_hex(0x2E2E2E), 204,
+                                           LV_RADIUS_CIRCLE);
+        add_tinted_picture(button, buttons[i], 3, 3, color::text_cool_muted);
+    }
+}
+
+void build_map_view(lv_obj_t *parent)
+{
+    add_tinted_picture(parent, EVB_ASSET_MAP_TERRAIN, panel_x_of_design_x(290), 60, lv_color_hex(0x414F42));
+    build_route_guidance(parent);
+    add_picture(parent, EVB_ASSET_MAP_CURSOR, 400 - picture_width(EVB_ASSET_MAP_CURSOR) / 2, 276);
+    build_no_route_hint(parent);
 }
 
 /* ---------- show ---------- */
@@ -451,6 +568,66 @@ void show_ride_mode(evb_ride_mode_t mode)
     lv_obj_set_style_text_color(screen.mode_label, sport ? color::text_primary : colors.accent, 0);
 }
 
+evb_asset_id_t turn_picture(uint8_t maneuver)
+{
+    static const evb_asset_id_t pictures[] = {
+        EVB_ASSET_ICON_NAV_28, EVB_ASSET_TURN_STRAIGHT, EVB_ASSET_TURN_SLIGHT_LEFT, EVB_ASSET_TURN_LEFT,
+        EVB_ASSET_TURN_SHARP_LEFT, EVB_ASSET_TURN_SLIGHT_RIGHT, EVB_ASSET_TURN_RIGHT, EVB_ASSET_TURN_SHARP_RIGHT,
+        EVB_ASSET_TURN_UTURN_LEFT, EVB_ASSET_TURN_UTURN_RIGHT, EVB_ASSET_TURN_ROUNDABOUT, EVB_ASSET_TURN_ROUNDABOUT_EXIT,
+        EVB_ASSET_TURN_FORK_LEFT, EVB_ASSET_TURN_FORK_RIGHT, EVB_ASSET_TURN_MERGE_LEFT, EVB_ASSET_TURN_MERGE_RIGHT,
+        EVB_ASSET_TURN_DESTINATION,
+    };
+    return maneuver < sizeof(pictures) / sizeof(pictures[0]) ? pictures[maneuver] : EVB_ASSET_ICON_NAV_28;
+}
+
+/* Format.distanceValue / distanceUnit from EVBikes. */
+void format_turn_distance(uint32_t meters, bool use_miles, char *text, size_t capacity)
+{
+    if (use_miles) {
+        constexpr float FEET_PER_METRE = 3.28084f;
+        constexpr float FEET_PER_MILE = 5280.0f;
+        float feet = meters * FEET_PER_METRE;
+        if (feet >= FEET_PER_MILE * 10) {
+            snprintf(text, capacity, "%d mi", (int)(feet / FEET_PER_MILE + 0.5f));
+        } else if (feet >= FEET_PER_MILE) {
+            int tenths = (int)(feet * 10 / FEET_PER_MILE);
+            snprintf(text, capacity, "%d.%d mi", tenths / 10, tenths % 10);
+        } else if (feet >= 500) {
+            snprintf(text, capacity, "%d ft", (int)(feet / 100 + 0.5f) * 100);
+        } else {
+            snprintf(text, capacity, "%d ft", (int)(feet / 10 + 0.5f) * 10);
+        }
+        return;
+    }
+    if (meters >= 10000) {
+        snprintf(text, capacity, "%d km", (int)((meters + 500) / 1000));
+    } else if (meters >= 1000) {
+        snprintf(text, capacity, "%d.%d km", (int)(meters / 1000), (int)(meters % 1000 / 100));
+    } else if (meters >= 100) {
+        snprintf(text, capacity, "%d m", (int)((meters + 25) / 50 * 50));
+    } else {
+        snprintf(text, capacity, "%d m", (int)((meters + 5) / 10 * 10));
+    }
+}
+
+void show_navigation(const NavState &nav, bool phone_connected, bool use_miles)
+{
+    set_shown(screen.route_layer, nav.active);
+    set_shown(screen.no_route_layer, !nav.active);
+    if (!nav.active) {
+        lv_label_set_text(screen.no_route_text, phone_connected ? "Start a route in the app" : "Connect your phone to navigate");
+        return;
+    }
+    lv_label_set_text(screen.road_name, nav.road);
+    show_picture(screen.turn_icon, turn_picture(nav.maneuver));
+    bool roundabout = nav.maneuver == 10;
+    set_shown(screen.roundabout_badge, roundabout);
+    lv_label_set_text_fmt(screen.roundabout_exit, "%d", nav.roundabout_exit);
+    char distance[24];
+    format_turn_distance(nav.distance_to_maneuver_m, use_miles, distance, sizeof(distance));
+    lv_label_set_text(screen.turn_distance, distance);
+}
+
 } // namespace
 
 void evb_ride_screen_create(lv_obj_t *parent, const evb_ride_screen_handlers_t *handlers)
@@ -463,15 +640,20 @@ void evb_ride_screen_create(lv_obj_t *parent, const evb_ride_screen_handlers_t *
 
     build_bars(screen.layer);
     screen.ride_view = add_full_screen_layer(screen.layer);
+    screen.map_view = add_full_screen_layer(screen.ride_view);
+    build_map_view(screen.map_view);
+    set_shown(screen.map_view, false);
     build_speed(screen.ride_view);
-    build_bike_orbit(screen.ride_view);
+    screen.bike_view = add_full_screen_layer(screen.ride_view);
+    build_bike_orbit(screen.bike_view);
     build_trip_counter(screen.ride_view);
     build_range_and_odometer(screen.ride_view);
     build_battery_and_temperature(screen.layer);
     build_dock(screen.layer);
 }
 
-void evb_ride_screen_show_state(const evb_vehicle_state_t *vehicle, const evb_cluster_settings_t *settings)
+void evb_ride_screen_show_state(const evb_vehicle_state_t *vehicle, const evb_cluster_settings_t *settings, const NavState *nav,
+                                bool phone_connected)
 {
     const evb_vehicle_state_t &old = screen.shown;
     bool first = !screen.has_shown_state;
@@ -516,6 +698,12 @@ void evb_ride_screen_show_state(const evb_vehicle_state_t *vehicle, const evb_cl
         show_picture(screen.alerts_icon, vehicle->alerts_muted ? EVB_ASSET_ICON_MUTE : EVB_ASSET_ICON_BELL);
     }
 
+    if (first || unit_changed || phone_connected != screen.shown_phone_connected || memcmp(nav, &screen.shown_nav, sizeof(NavState)) != 0) {
+        show_navigation(*nav, phone_connected, settings->use_miles);
+        screen.shown_nav = *nav;
+        screen.shown_phone_connected = phone_connected;
+    }
+
     screen.shown = *vehicle;
     screen.shown_use_miles = settings->use_miles;
     screen.has_shown_state = true;
@@ -524,6 +712,15 @@ void evb_ride_screen_show_state(const evb_vehicle_state_t *vehicle, const evb_cl
 void evb_ride_screen_show_menu_open(bool menu_open)
 {
     set_shown(screen.ride_view, !menu_open);
-    set_shown(screen.settings_band, menu_open);
+    set_shown(screen.settings_tile, menu_open);
     tint_picture(screen.settings_icon, menu_open ? color::text_primary : color::text_slate);
+}
+
+void evb_ride_screen_show_map(bool map_shown)
+{
+    screen.map_shown = map_shown;
+    set_shown(screen.map_view, map_shown);
+    set_shown(screen.bike_view, !map_shown);
+    set_shown(screen.navigation_tile, map_shown);
+    tint_picture(screen.navigation_icon, map_shown ? color::text_primary : color::text_cool_muted);
 }

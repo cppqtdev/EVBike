@@ -3,7 +3,9 @@
 #include <esp_err.h>
 
 #include <lvgl.h>
+#include "evb_bluetooth.h"
 #include "evb_cluster_app.h"
+#include "evb_wifi.h"
 
 #include "esp_lv_adapter_arduino.h"
 
@@ -67,6 +69,9 @@ void setup()
     ESP_ERROR_CHECK(esp_lv_adapter_lock(-1));
     evb_cluster_app_start();
     esp_lv_adapter_unlock();
+
+    evb_bluetooth_start();
+    evb_wifi_start();
 
     Serial.println("EVBikes cluster ready");
 }

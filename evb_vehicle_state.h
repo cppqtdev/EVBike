@@ -28,8 +28,6 @@ typedef struct {
     int tyre_front_psi_x10;
     int tyre_rear_psi_x10;
     int fault_code;
-    int clock_hours;
-    int clock_minutes;
     evb_gear_t gear;
     evb_ride_mode_t ride_mode;
     bool indicator_left_on;
@@ -40,6 +38,5 @@ typedef struct {
     bool abs_fault_on;
     bool side_stand_down;
     bool charger_plugged;
-    bool phone_connected;
     bool alerts_muted;
 } evb_vehicle_state_t;

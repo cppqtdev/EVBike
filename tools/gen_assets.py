@@ -229,8 +229,6 @@ def build_pictures(t):
                     ('COMPASS', 'icons/36/compass.png'), ('BELL', 'icons/24/bell.png'),
                     ('MUTE', 'icons/24/mute.png'), ('SETTINGS', 'icons/24/settings.png')):
         t.a8(f'ICON_{name}', alpha_of(p))
-    t.a8('DOCK_BAND', alpha_of('cluster/band_right.png'))
-    t.a8('DOCK_BAND_LIP', alpha_of('cluster/band_right_lip.png'))
 
     # Splash, unlock and pre-ride
     for i in range(8):
@@ -275,6 +273,25 @@ def build_pictures(t):
                     ('BACK_CURVE', 'icons/28/back_curve.png')):
         t.a8(f'ICON_{name}', alpha_of(p))
     t.picture('ALBUM_ART', rgba_of('cluster/album_art.png'))
+
+    # Navigation, calls and dock tiles
+    for name in ('map_terrain', 'map_route'):
+        p = f'design/{name}.png'
+        t.a8(name.upper(), alpha_of(p, squashed_width(p)))
+    t.a8('MAP_PIN', alpha_of('design/map_pin.png'))
+    t.picture('MAP_CURSOR', rgba_of('design/map_cursor.png'))
+    t.a8('DOCK_TILE', alpha_of('cluster/tile_slant.png'))
+    t.a8('DOCK_TILE_NARROW', alpha_of('cluster/tile_slant.png', 66))
+    for turn in ('straight', 'slight_left', 'left', 'sharp_left', 'slight_right', 'right', 'sharp_right', 'uturn_left',
+                 'uturn_right', 'roundabout', 'roundabout_exit', 'fork_left', 'fork_right', 'merge_left', 'merge_right',
+                 'destination'):
+        t.a8(f'TURN_{turn.upper()}', alpha_of(f'turns/28/{turn}.png'))
+    t.a8('ICON_NAV_28', alpha_of('icons/28/nav.png'))
+    for name in ('flag', 'mic', 'target', 'layers', 'wrench', 'building', 'station', 'triangle'):
+        t.a8(f'ICON_{name.upper()}_18', alpha_of(f'icons/18/{name}.png'))
+    t.a8('ICON_PIN_30', alpha_of('icons/30/pin.png'))
+    t.a8('ICON_PHONE_40', alpha_of('icons/40/phone.png'))
+    t.a8('GLOW_BLOB_150', alpha_of('images/glow_blob_150x40.png'))
 
 
 # ---------- fonts ----------

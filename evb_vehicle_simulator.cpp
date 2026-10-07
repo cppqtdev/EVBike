@@ -41,7 +41,6 @@ struct Simulator {
     uint32_t leg_elapsed_ms;
     uint32_t blink_elapsed_ms;
     uint32_t drain_elapsed_ms;
-    uint32_t clock_elapsed_ms;
 };
 
 Simulator sim;
@@ -123,19 +122,6 @@ void drain_battery(evb_vehicle_state_t *vehicle, uint32_t elapsed_ms)
     vehicle->pack_temp_c = 52 + vehicle->power_percent / 10;
 }
 
-void advance_clock(evb_vehicle_state_t *vehicle, uint32_t elapsed_ms)
-{
-    sim.clock_elapsed_ms += elapsed_ms;
-    if (sim.clock_elapsed_ms >= 60000) {
-        sim.clock_elapsed_ms -= 60000;
-        vehicle->clock_minutes++;
-        if (vehicle->clock_minutes == 60) {
-            vehicle->clock_minutes = 0;
-            vehicle->clock_hours = (vehicle->clock_hours + 1) % 24;
-        }
-    }
-}
-
 } // namespace
 
 void evb_vehicle_simulator_reset(evb_vehicle_state_t *vehicle)
@@ -153,12 +139,9 @@ void evb_vehicle_simulator_reset(evb_vehicle_state_t *vehicle)
     vehicle->ambient_temp_c = 27;
     vehicle->tyre_front_psi_x10 = 320;
     vehicle->tyre_rear_psi_x10 = 320;
-    vehicle->clock_hours = 1;
-    vehicle->clock_minutes = 11;
     vehicle->gear = EVB_GEAR_PARK;
     vehicle->ride_mode = EVB_RIDE_MODE_ECO;
     vehicle->low_beam_on = true;
-    vehicle->phone_connected = true;
 }
 
 void evb_vehicle_simulator_step(evb_vehicle_state_t *vehicle, uint32_t elapsed_ms, bool may_ride)
@@ -175,5 +158,4 @@ void evb_vehicle_simulator_step(evb_vehicle_state_t *vehicle, uint32_t elapsed_m
     vehicle->charger_plugged = !may_ride && vehicle->speed_kmh == 0;
     add_travelled_distance(vehicle, seconds);
     drain_battery(vehicle, elapsed_ms);
-    advance_clock(vehicle, elapsed_ms);
 }

@@ -33,6 +33,4 @@ typedef struct {
     evb_speedo_style_t speedo_style;
     bool demo_running;
     bool payment_done;
-    bool media_playing;
-    int track_position_s;
 } evb_cluster_settings_t;

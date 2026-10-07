@@ -1,8 +1,13 @@
 #include "evb_menu.h"
 
 #include <stdio.h>
+#include <string.h>
 
+#include "evb_bluetooth.h"
+#include "evb_clock.h"
+#include "evb_firmware_info.h"
 #include "evb_ui_kit.h"
+#include "evb_wifi.h"
 
 /*
  * Menu pages keep their design size; their design x is moved by 245 so the design
@@ -15,11 +20,10 @@ using namespace evb;
 
 namespace {
 
-constexpr int MENU_PAGE_COUNT = 11;
+constexpr int MENU_PAGE_COUNT = 13;
 constexpr int CAROUSEL_TOP = 303;
 constexpr uint32_t LOCK_HINT_MS = 2000;
-constexpr uint32_t PAIRING_MS = 1500;
-constexpr int TRACK_LENGTH_S = 233;
+constexpr uint32_t PHONE_PAGE_REBUILD_MS = 500;
 constexpr uint32_t REFRESH_MS = 250;
 
 enum MenuPageIndex {
@@ -33,12 +37,14 @@ enum MenuPageIndex {
     PAGE_CUSTOMIZE,
     PAGE_MISC,
     PAGE_CONNECTIVITY,
+    PAGE_WIFI,
+    PAGE_SYSTEM,
     PAGE_VITALS,
 };
 
 const char *const PAGE_TITLES[MENU_PAGE_COUNT] = {
     "Profile", "Digilocker", "Seat", "Charging", "Bike status", "Security",
-    "Payment", "Customize", "Misc.", "Connections", "Vitals",
+    "Payment", "Customize", "Misc.", "Connections", "Wi-Fi", "System", "Vitals",
 };
 
 int page_x(int design_x)
@@ -51,6 +57,15 @@ int page_x(int design_x)
 struct Menu {
     evb_cluster_settings_t *settings;
     evb_vehicle_state_t *vehicle;
+    const PhoneState *phone;
+    uint32_t now_ms;
+    uint32_t shown_phone_revision;
+    uint32_t phone_rebuild_elapsed_ms;
+
+    lv_obj_t *keyboard_layer;
+    lv_obj_t *password_title;
+    lv_obj_t *password_area;
+    char password_ssid[33];
 
     lv_obj_t *layer;
     lv_obj_t *page_host;
@@ -64,10 +79,7 @@ struct Menu {
     int page_index;
     int sub_index;
     int sub_level;
-    bool pairing;
-    uint32_t pairing_elapsed_ms;
     uint32_t refresh_elapsed_ms;
-    uint32_t track_elapsed_ms;
 };
 
 Menu menu;
@@ -80,9 +92,7 @@ struct LiveLabels {
     lv_obj_t *charging_arc;
     lv_obj_t *charging_plug_mark;
     lv_obj_t *music_knob;
-    lv_obj_t *music_play_icon;
-    lv_obj_t *connection_status;
-    lv_obj_t *connection_button_text;
+    lv_obj_t *music_time;
     lv_obj_t *vitals_power;
     lv_obj_t *vitals_range;
     lv_obj_t *vitals_pack_temp;
@@ -637,23 +647,6 @@ void build_customize_page(lv_obj_t *page)
 
 /* ---------- Misc ---------- */
 
-struct ListRow {
-    char initial;
-    const char *name;
-    const char *body;
-};
-
-const ListRow CONTACTS[3] = {
-    {'K', "Karan", "Reached the office, see you soon"},
-    {'A', "Akash", "Lunch at 1?"},
-    {'M', "Myra", "Call me when you are free"},
-};
-const ListRow REMINDERS[3] = {
-    {'S', "Service due", "In 240 km"},
-    {'I', "Insurance renewal", "12 November"},
-    {'T', "Tyre check", "Every 15 days"},
-};
-
 void on_misc_tab_tapped(lv_event_t *event)
 {
     menu.sub_index = (int)(intptr_t)lv_event_get_user_data(event);
@@ -668,21 +661,21 @@ void on_list_row_tapped(lv_event_t *event)
     rebuild_page();
 }
 
-void on_play_pause_tapped(lv_event_t *event)
+void on_call_contact_tapped(lv_event_t *event)
 {
     LV_UNUSED(event);
-    menu.settings->media_playing = !menu.settings->media_playing;
-    show_picture(live.music_play_icon, menu.settings->media_playing ? EVB_ASSET_ICON_PAUSE : EVB_ASSET_ICON_PLAY);
+    if (menu.sub_level > 0) {
+        evb_bluetooth_call_contact(menu.sub_level - 1);
+    }
 }
 
-void on_skip_track_tapped(lv_event_t *event)
+void on_media_command_tapped(lv_event_t *event)
 {
-    LV_UNUSED(event);
-    menu.settings->track_position_s = 0;
+    evb_bluetooth_send_media_command((MediaCommand)(intptr_t)lv_event_get_user_data(event));
 }
 
 /* MessageRow.qml */
-void add_message_row(lv_obj_t *parent, int x, int y, const ListRow &entry, lv_color_t avatar_color, bool hide_text_while_moving,
+void add_message_row(lv_obj_t *parent, int x, int y, const TextRow &entry, lv_color_t avatar_color, bool hide_text_while_moving,
                      bool selected, int row)
 {
     constexpr int width = 280;
@@ -691,23 +684,65 @@ void add_message_row(lv_obj_t *parent, int x, int y, const ListRow &entry, lv_co
     lv_obj_t *inside = add_color_block(outline, 1, 1, width - 2, height - 2, selected ? lv_color_hex(0x16221F) : lv_color_hex(0x0E1011),
                                        LV_OPA_COVER, (height - 2) / 2);
     lv_obj_t *avatar = add_color_block(inside, 7, 4, 32, 32, avatar_color, LV_OPA_COVER, 16);
-    char initial[2] = {entry.initial, '\0'};
+    char initial[2] = {entry.title[0], '\0'};
     lv_obj_center(add_text(avatar, &evb_font_bold_14, color::text_primary, initial));
 
     bool hide_text = hide_text_while_moving && menu.vehicle->speed_kmh > 0;
-    add_text_at(inside, &evb_font_regular_15, color::text_primary, entry.name, 49, 4);
+    lv_obj_t *name = add_text_at(inside, &evb_font_regular_15, color::text_primary, entry.title, 49, 4);
+    lv_label_set_long_mode(name, LV_LABEL_LONG_MODE_DOTS);
+    lv_obj_set_width(name, 220);
     lv_obj_t *body = add_text_at(inside, &evb_font_regular_12, selected ? color::text_primary : color::text_secondary,
-                                 hide_text ? "Stop to read" : entry.body, 49, 22);
+                                 hide_text ? "Stop to read" : entry.text, 49, 22);
     lv_label_set_long_mode(body, LV_LABEL_LONG_MODE_DOTS);
     lv_obj_set_width(body, 220);
     call_on_tap(outline, on_list_row_tapped, (void *)(intptr_t)row);
 }
 
-void refresh_music_knob(void)
+lv_obj_t *add_small_button(lv_obj_t *parent, int x, int y, int width, const char *text, lv_event_cb_t on_tapped, void *context)
 {
-    constexpr int line_x = 315;
-    int x = line_x + 170 * menu.settings->track_position_s / TRACK_LENGTH_S - 3;
+    lv_obj_t *button = add_color_block(parent, x, y, width, 30, color::surface_selected, LV_OPA_COVER, 4);
+    lv_obj_center(add_text(button, &evb_font_regular_14, color::text_primary, text));
+    call_on_tap(button, on_tapped, context);
+    return button;
+}
+
+/* A round media button; the touch area is bigger than the icon. */
+void add_media_button(lv_obj_t *parent, int center_x, int center_y, evb_asset_id_t icon, const char *text, MediaCommand command,
+                      bool enabled, lv_color_t icon_color)
+{
+    lv_obj_t *button = add_color_block(parent, center_x - 17, center_y - 17, 34, 34, color::neutral22, LV_OPA_COVER, LV_RADIUS_CIRCLE);
+    lv_color_t shown = enabled ? icon_color : color::text_muted;
+    if (text != NULL) {
+        lv_obj_center(add_text(button, &evb_font_regular_20, shown, text));
+    } else {
+        lv_obj_t *picture = add_tinted_picture(button, icon, 0, 0, shown);
+        lv_obj_center(picture);
+    }
+    if (enabled) {
+        call_on_tap(button, on_media_command_tapped, (void *)(intptr_t)command);
+    }
+}
+
+int media_position_now(const PhoneState *phone, uint32_t now_ms)
+{
+    int position = phone->media_position_s;
+    if (phone->media_playing) {
+        position += (int)((now_ms - phone->media_position_at_ms) / 1000);
+    }
+    if (phone->media_duration_s > 0 && position > phone->media_duration_s) {
+        position = phone->media_duration_s;
+    }
+    return position;
+}
+
+void refresh_music_progress(void)
+{
+    const PhoneState *phone = menu.phone;
+    int duration = phone->media_duration_s;
+    int position = media_position_now(phone, menu.now_ms);
+    int x = page_x(560) + (duration > 0 ? 170 * position / duration : 0) - 3;
     lv_obj_set_x(live.music_knob, x);
+    lv_label_set_text_fmt(live.music_time, "%d:%02d", position / 60, position % 60);
 }
 
 /* The design's music block starts at y 118, under a tab strip that ends at y 128; it sits 12 px lower here. */
@@ -715,92 +750,414 @@ constexpr int MUSIC_TOP = 130;
 
 void build_music_tab(lv_obj_t *page)
 {
-    bool connected = menu.vehicle->phone_connected;
+    const PhoneState *phone = menu.phone;
+    if (!phone->phone_connected) {
+        add_wrapped_text(page, &evb_font_regular_14, color::text_muted,
+                         "Pair your phone in its Bluetooth settings to control music", 400, 170, 360);
+        return;
+    }
+    bool has_track = phone->media_info_available && phone->media_title[0] != '\0';
+    bool controls = phone->media_controls_available;
     add_centered_text(page, &evb_font_italic_11, color::text_secondary, "NOW PLAYING", 400, MUSIC_TOP);
     add_picture(page, EVB_ASSET_ALBUM_ART, 405 - 38, MUSIC_TOP + 16);
-    add_centered_text(page, &evb_font_regular_15, color::text_primary, connected ? "Dandelions" : "Nothing playing", 400, MUSIC_TOP + 96);
-    add_centered_text(page, &evb_font_regular_10, color::text_secondary, connected ? "Ruth B." : "", 400, MUSIC_TOP + 114);
+    lv_obj_t *title = add_centered_text(page, &evb_font_regular_15, color::text_primary,
+                                        has_track ? phone->media_title : (phone->media_info_available ? "Nothing playing" : "Your phone's music"),
+                                        400, MUSIC_TOP + 96);
+    lv_label_set_long_mode(title, LV_LABEL_LONG_MODE_DOTS);
+    lv_obj_set_width(title, 300);
+    add_centered_text(page, &evb_font_regular_10, color::text_secondary, has_track ? phone->media_artist : "", 400, MUSIC_TOP + 114);
 
-    add_tinted_picture(page, EVB_ASSET_ICON_PREV, page_x(580), MUSIC_TOP + 130, color::divider_cool);
-    live.music_play_icon = add_tinted_picture(page, menu.settings->media_playing ? EVB_ASSET_ICON_PAUSE : EVB_ASSET_ICON_PLAY,
-                                              page_x(636), MUSIC_TOP + 129, color::text_primary);
-    add_tinted_picture(page, EVB_ASSET_ICON_NEXT, page_x(692), MUSIC_TOP + 130, color::divider_cool);
-    add_touch_area(page, page_x(580) - 12, MUSIC_TOP + 118, 42, 40, on_skip_track_tapped, NULL);
-    add_touch_area(page, page_x(636) - 12, MUSIC_TOP + 118, 42, 40, on_play_pause_tapped, NULL);
-    add_touch_area(page, page_x(692) - 12, MUSIC_TOP + 118, 42, 40, on_skip_track_tapped, NULL);
+    int controls_y = MUSIC_TOP + 139;
+    add_media_button(page, 290, controls_y, EVB_ASSET_ICON_PREV, "-", MediaCommand::VolumeDown, controls, color::divider_cool);
+    add_media_button(page, page_x(580) + 9, controls_y, EVB_ASSET_ICON_PREV, NULL, MediaCommand::Previous, controls, color::divider_cool);
+    add_media_button(page, page_x(636) + 9, controls_y, phone->media_playing ? EVB_ASSET_ICON_PAUSE : EVB_ASSET_ICON_PLAY, NULL,
+                     MediaCommand::PlayPause, controls, color::text_primary);
+    add_media_button(page, page_x(692) + 9, controls_y, EVB_ASSET_ICON_NEXT, NULL, MediaCommand::Next, controls, color::divider_cool);
+    add_media_button(page, 510, controls_y, EVB_ASSET_ICON_NEXT, "+", MediaCommand::VolumeUp, controls, color::divider_cool);
 
-    add_color_block(page, page_x(560), MUSIC_TOP + 156, 170, 1, color::stroke2, LV_OPA_COVER, 0);
-    live.music_knob = add_color_block(page, page_x(560), MUSIC_TOP + 153, 7, 7, color::text_primary, LV_OPA_COVER, LV_RADIUS_CIRCLE);
-    refresh_music_knob();
+    if (phone->media_info_available) {
+        lv_obj_t *volume = add_text_at(page, &evb_font_regular_11, color::text_muted, "", 540, controls_y - 7);
+        lv_label_set_text_fmt(volume, "Vol %d%%", phone->media_volume_percent);
+    }
+    if (phone->media_duration_s > 0) {
+        add_color_block(page, page_x(560), MUSIC_TOP + 162, 170, 1, color::stroke2, LV_OPA_COVER, 0);
+        live.music_knob = add_color_block(page, page_x(560), MUSIC_TOP + 159, 7, 7, color::text_primary, LV_OPA_COVER, LV_RADIUS_CIRCLE);
+        live.music_time = add_text_at(page, &evb_font_regular_10, color::text_secondary, "", page_x(560) - 34, MUSIC_TOP + 156);
+        lv_obj_t *length = add_text_at(page, &evb_font_regular_10, color::text_secondary, "", page_x(560) + 176, MUSIC_TOP + 156);
+        lv_label_set_text_fmt(length, "%d:%02d", phone->media_duration_s / 60, phone->media_duration_s % 60);
+        refresh_music_progress();
+    }
+}
+
+void build_phone_list(lv_obj_t *page, bool messages)
+{
+    const PhoneState *phone = menu.phone;
+    const TextRow *rows = messages ? phone->contacts : phone->reminders;
+    int count = 0;
+    for (int i = 0; i < EVB_LIST_SLOTS; i++) {
+        if (rows[i].title[0] != '\0') {
+            count = i + 1;
+        }
+    }
+    if (count == 0) {
+        const char *empty = messages ? "No messages yet" : "No reminders yet";
+        if (!phone->phone_connected) {
+            empty = "Pair your phone in its Bluetooth settings";
+        } else if (!messages && phone->link_kind != PhoneLinkKind::EvbikesApp) {
+            empty = "Reminders come from the EVBikes app";
+        }
+        add_centered_text(page, &evb_font_regular_14, color::text_muted, empty, 400, 170);
+        return;
+    }
+    lv_color_t avatar_color = messages ? color::success_muted : lv_color_hex(0x8A5A2F);
+    for (int i = 0; i < count; i++) {
+        add_message_row(page, page_x(505), 133 + i * 48, rows[i], avatar_color, messages, menu.sub_level - 1 == i, i);
+    }
+    bool row_selected = menu.sub_level > 0 && menu.sub_level <= count;
+    if (messages && row_selected && phone->can_dial) {
+        char text[EVB_TEXT_MAX + 8];
+        snprintf(text, sizeof(text), "Call %s", rows[menu.sub_level - 1].title);
+        lv_obj_t *call = add_color_block(page, 0, 274, 200, 26, lv_color_hex(0x143A2A), LV_OPA_COVER, 13);
+        place_by_top_center(call, 400, 275);
+        lv_obj_t *label = add_text(call, &evb_font_bold_13, color::green, text);
+        lv_label_set_long_mode(label, LV_LABEL_LONG_MODE_DOTS);
+        lv_obj_set_width(label, 180);
+        lv_obj_set_style_text_align(label, LV_TEXT_ALIGN_CENTER, 0);
+        lv_obj_center(label);
+        call_on_tap(call, on_call_contact_tapped, NULL);
+        return;
+    }
+    const char *hint = "Tap a row to select it";
+    if (messages && row_selected) {
+        hint = "Reply on your phone";
+    }
+    add_centered_text(page, &evb_font_regular_11, color::text_muted, hint, 400, 280);
 }
 
 void build_misc_page(lv_obj_t *page)
 {
     static const char *const tabs[3] = {"message", "music", "reminder"};
     add_tab_strip(page, 92, tabs, menu.sub_index, on_misc_tab_tapped);
-
     if (menu.sub_index == 1) {
         build_music_tab(page);
-        return;
+    } else {
+        build_phone_list(page, menu.sub_index == 0);
     }
-
-    bool messages = menu.sub_index == 0;
-    bool has_rows = !messages || menu.vehicle->phone_connected;
-    if (!has_rows) {
-        add_centered_text(page, &evb_font_regular_14, color::text_muted, "No messages yet", 400, 170);
-        return;
-    }
-    const ListRow *rows = messages ? CONTACTS : REMINDERS;
-    lv_color_t avatar_color = messages ? color::success_muted : lv_color_hex(0x8A5A2F);
-    for (int i = 0; i < 3; i++) {
-        add_message_row(page, page_x(505), 133 + i * 48, rows[i], avatar_color, messages, menu.sub_level - 1 == i, i);
-    }
-    add_centered_text(page, &evb_font_regular_11, color::text_muted, "Tap a row to select it", 400, 274);
 }
 
 /* ---------- Connections ---------- */
 
-void on_pair_tapped(lv_event_t *event)
+void move_menu_to(int page_index);
+
+void on_forget_phones_tapped(lv_event_t *event)
 {
     LV_UNUSED(event);
-    if (menu.vehicle->speed_kmh != 0 || menu.pairing) {
-        return;
+    evb_bluetooth_forget_phones();
+}
+
+void on_wifi_settings_tapped(lv_event_t *event)
+{
+    LV_UNUSED(event);
+    move_menu_to(PAGE_WIFI);
+}
+
+const char *bluetooth_summary(const PhoneState *phone)
+{
+    if (!phone->bluetooth_ready) {
+        return "Bluetooth is starting...";
     }
-    if (menu.vehicle->phone_connected) {
-        menu.vehicle->phone_connected = false;
-    } else {
-        menu.pairing = true;
-        menu.pairing_elapsed_ms = 0;
+    if (!phone->phone_connected) {
+        return "No phone. On the phone open Bluetooth settings and pair \"EVBikes Cluster\".";
+    }
+    switch (phone->link_kind) {
+    case PhoneLinkKind::Iphone:
+        return "iPhone connected: calls, messages, music and clock.";
+    case PhoneLinkKind::EvbikesApp:
+        return "EVBikes app connected: navigation, calls, contacts and music.";
+    default:
+        return phone->phone_bonded ? "Phone connected: music keys. Install the EVBikes app for navigation and calls."
+                                   : "Phone connected. Accept the pairing request on the phone.";
     }
 }
 
-void refresh_connectivity_page(void)
+const char *wifi_summary(const PhoneState *phone, char *text, size_t capacity)
 {
-    const char *status = "No phone paired";
-    if (menu.pairing) {
-        status = "Pairing with demo phone...";
-    } else if (menu.vehicle->phone_connected) {
-        status = "Demo phone connected";
+    switch (phone->wifi_status) {
+    case WifiStatus::Connected:
+        snprintf(text, capacity, "Wi-Fi: %s (%s)", phone->wifi_ssid, phone->wifi_ip);
+        break;
+    case WifiStatus::Connecting:
+        snprintf(text, capacity, "Wi-Fi: joining %s...", phone->wifi_ssid);
+        break;
+    case WifiStatus::Failed:
+        snprintf(text, capacity, "Wi-Fi: could not join %s", phone->wifi_ssid);
+        break;
+    default:
+        snprintf(text, capacity, "Wi-Fi: no network saved");
+        break;
     }
-    lv_label_set_text(live.connection_status, status);
-    lv_label_set_text(live.connection_button_text, menu.vehicle->phone_connected ? "Disconnect demo phone" : "Pair demo phone");
+    return text;
 }
 
 void build_connectivity_page(lv_obj_t *page)
 {
     constexpr int left = 155;
-    add_text_at(page, &evb_font_regular_22, color::text_primary, "Connections", left, 78);
-    live.connection_status = add_text_at(page, &evb_font_regular_16, color::text_secondary, "", left, 118);
-    lv_obj_t *button = add_color_block(page, left, 153, 230, 38, color::surface_selected, LV_OPA_COVER, 4);
-    live.connection_button_text = add_text(button, &evb_font_regular_16, color::text_primary, "");
-    lv_obj_center(live.connection_button_text);
-    call_on_tap(button, on_pair_tapped, NULL);
-    add_text_at(page, &evb_font_regular_16, color::text_muted, "Wi-Fi: no supported radio configured", left, 212);
+    const PhoneState *phone = menu.phone;
+    add_text_at(page, &evb_font_regular_22, color::text_primary, "Connections", left, 72);
+    lv_obj_t *bluetooth = add_text_at(page, &evb_font_regular_16, color::text_secondary, bluetooth_summary(phone), left, 106);
+    lv_label_set_long_mode(bluetooth, LV_LABEL_LONG_MODE_WRAP);
+    lv_obj_set_width(bluetooth, 480);
+    if (phone->phone_connected && phone->phone_battery_percent > 0) {
+        lv_obj_t *battery = add_text_at(page, &evb_font_regular_14, color::text_muted, "", left, 150);
+        lv_label_set_text_fmt(battery, "Phone battery %d%%", phone->phone_battery_percent);
+    }
+    add_small_button(page, left, 172, 200, "Forget paired phones", on_forget_phones_tapped, NULL);
+
+    char wifi[80];
+    add_text_at(page, &evb_font_regular_16, color::text_secondary, wifi_summary(phone, wifi, sizeof(wifi)), left, 216);
+    add_small_button(page, left + 330, 212, 150, "Wi-Fi networks", on_wifi_settings_tapped, NULL);
+
     lv_obj_t *footer = add_text_at(page, &evb_font_regular_12, color::text_muted,
-                                   "Simulator only. Pairing controls require the bike to be stopped.", left, 246);
+                                   "Call and music audio stay on the phone or helmet headset: this board has Bluetooth Low Energy only.",
+                                   left, 256);
     lv_label_set_long_mode(footer, LV_LABEL_LONG_MODE_WRAP);
     lv_obj_set_width(footer, 480);
-    refresh_connectivity_page();
+}
+
+/* ---------- Wi-Fi ---------- */
+
+constexpr int WIFI_ROWS_SHOWN = 5;
+
+void on_wifi_scan_tapped(lv_event_t *event)
+{
+    LV_UNUSED(event);
+    evb_wifi_scan();
+}
+
+void on_wifi_forget_tapped(lv_event_t *event)
+{
+    LV_UNUSED(event);
+    evb_wifi_forget();
+}
+
+void open_password_keyboard(const char *ssid);
+
+void on_wifi_network_tapped(lv_event_t *event)
+{
+    int index = (int)(intptr_t)lv_event_get_user_data(event);
+    const WifiNetwork &network = menu.phone->wifi_networks[index];
+    if (network.secured) {
+        open_password_keyboard(network.ssid);
+    } else {
+        evb_wifi_connect(network.ssid, "");
+    }
+}
+
+/* Four signal bars from the RSSI, like a phone's status bar. */
+void add_signal_bars(lv_obj_t *parent, int x, int y, int rssi)
+{
+    int bars = rssi >= -55 ? 4 : (rssi >= -65 ? 3 : (rssi >= -75 ? 2 : 1));
+    for (int i = 0; i < 4; i++) {
+        int height = 4 + i * 3;
+        add_color_block(parent, x + i * 5, y + 13 - height, 3, height, i < bars ? color::text_primary : color::stroke, LV_OPA_COVER, 1);
+    }
+}
+
+void build_wifi_page(lv_obj_t *page)
+{
+    constexpr int left = 155;
+    constexpr int width = 480;
+    const PhoneState *phone = menu.phone;
+    char status[80];
+    add_text_at(page, &evb_font_regular_16, color::text_secondary, wifi_summary(phone, status, sizeof(status)), left, 72);
+    add_small_button(page, left, 98, 120, phone->wifi_scanning ? "Scanning..." : "Scan", on_wifi_scan_tapped, NULL);
+    if (phone->wifi_status != WifiStatus::NoNetworkSaved) {
+        add_small_button(page, left + width - 120, 98, 120, "Forget", on_wifi_forget_tapped, NULL);
+    }
+
+    int shown = phone->wifi_network_count < WIFI_ROWS_SHOWN ? phone->wifi_network_count : WIFI_ROWS_SHOWN;
+    if (shown == 0) {
+        add_centered_text(page, &evb_font_regular_14, color::text_muted,
+                          phone->wifi_scanning ? "Looking for networks..." : "Tap Scan to find networks", 400, 190);
+        return;
+    }
+    for (int i = 0; i < shown; i++) {
+        const WifiNetwork &network = phone->wifi_networks[i];
+        bool current = phone->wifi_status == WifiStatus::Connected && strcmp(network.ssid, phone->wifi_ssid) == 0;
+        lv_obj_t *row = add_plain_box(page, left, 136 + i * 32, width, 30);
+        if (current) {
+            lv_obj_set_style_bg_color(row, lv_color_hex(0x1D4A3E), 0);
+            lv_obj_set_style_bg_opa(row, LV_OPA_COVER, 0);
+            lv_obj_set_style_radius(row, 8, 0);
+        }
+        add_signal_bars(row, 12, 8, network.rssi);
+        lv_obj_t *name = add_text_at(row, &evb_font_regular_16, color::text_primary, network.ssid, 46, 5);
+        lv_label_set_long_mode(name, LV_LABEL_LONG_MODE_DOTS);
+        lv_obj_set_width(name, 300);
+        lv_obj_t *kind = add_text(row, &evb_font_regular_13, current ? color::teal : color::text_muted,
+                                  current ? "connected" : (network.secured ? "secured" : "open"));
+        lv_obj_align(kind, LV_ALIGN_RIGHT_MID, -12, 0);
+        call_on_tap(row, on_wifi_network_tapped, (void *)(intptr_t)i);
+    }
+}
+
+/* ---------- System: clock, time zone and firmware updates ---------- */
+
+void on_time_zone_tapped(lv_event_t *event)
+{
+    int step = (int)(intptr_t)lv_event_get_user_data(event);
+    evb_clock_set_utc_offset(evb_clock_utc_offset_minutes() + step * 30);
+    rebuild_page();
+}
+
+void on_check_update_tapped(lv_event_t *event)
+{
+    LV_UNUSED(event);
+    evb_wifi_check_for_update();
+}
+
+void on_install_update_tapped(lv_event_t *event)
+{
+    LV_UNUSED(event);
+    evb_wifi_install_update();
+}
+
+void build_system_page(lv_obj_t *page)
+{
+    constexpr int left = 155;
+    const PhoneState *phone = menu.phone;
+
+    lv_obj_t *firmware = add_text_at(page, &evb_font_regular_18, color::text_primary, "", left, 70);
+    lv_label_set_text_fmt(firmware, "Firmware %s", EVB_FIRMWARE_VERSION);
+
+    int hours = 0;
+    int minutes = 0;
+    lv_obj_t *clock = add_text_at(page, &evb_font_regular_15, color::text_secondary, "", left, 100);
+    if (evb_clock_read_local(&hours, &minutes)) {
+        lv_label_set_text_fmt(clock, "Clock %02d:%02d, set by %s", hours, minutes, phone->clock_source);
+    } else {
+        lv_label_set_text(clock, "Clock not set yet: join Wi-Fi or connect a phone");
+    }
+
+    int offset = evb_clock_utc_offset_minutes();
+    int magnitude = offset < 0 ? -offset : offset;
+    lv_obj_t *zone = add_text_at(page, &evb_font_regular_15, color::text_secondary, "", left, 130);
+    lv_label_set_text_fmt(zone, "Time zone UTC%c%02d:%02d", offset < 0 ? '-' : '+', magnitude / 60, magnitude % 60);
+    add_small_button(page, left + 330, 124, 70, "- 30m", on_time_zone_tapped, (void *)(intptr_t)-1);
+    add_small_button(page, left + 410, 124, 70, "+ 30m", on_time_zone_tapped, (void *)(intptr_t)1);
+
+    add_color_block(page, left, 164, 480, 1, color::neutral3e, LV_OPA_COVER, 0);
+    lv_obj_t *message = add_text_at(page, &evb_font_regular_15, color::text_primary, phone->update_message, left, 174);
+    lv_label_set_long_mode(message, LV_LABEL_LONG_MODE_DOTS);
+    lv_obj_set_width(message, 320);
+    if (phone->update_status == UpdateStatus::Downloading || phone->update_status == UpdateStatus::Done) {
+        lv_obj_t *track = add_color_block(page, left, 202, 300, 6, color::stroke, LV_OPA_COVER, 3);
+        add_color_block(track, 0, 0, 300 * phone->update_percent / 100, 6, color::teal, LV_OPA_COVER, 3);
+        lv_obj_t *percent = add_text_at(page, &evb_font_regular_13, color::text_secondary, "", left + 310, 197);
+        lv_label_set_text_fmt(percent, "%d%%", phone->update_percent);
+    } else if (phone->update_status == UpdateStatus::Available) {
+        char text[40];
+        snprintf(text, sizeof(text), "Install %s", phone->update_version);
+        add_small_button(page, left + 330, 170, 150, text, on_install_update_tapped, NULL);
+    } else {
+        add_small_button(page, left + 330, 170, 150, "Check for updates", on_check_update_tapped, NULL);
+    }
+
+    lv_obj_t *upload = add_text_at(page, &evb_font_regular_12, color::text_muted, "", left, 226);
+    lv_label_set_long_mode(upload, LV_LABEL_LONG_MODE_WRAP);
+    lv_obj_set_width(upload, 480);
+    if (phone->network_upload_ready) {
+        lv_label_set_text_fmt(upload, "Arduino IDE upload over Wi-Fi: Tools > Port > %s (%s), password \"%s\".", EVB_NETWORK_UPLOAD_HOSTNAME,
+                              phone->wifi_ip, EVB_NETWORK_UPLOAD_PASSWORD);
+    } else {
+        lv_label_set_text(upload, "Upload over Wi-Fi starts once Wi-Fi is joined. It needs an OTA partition scheme, "
+                                  "for example \"8M with spiffs (3MB APP/1.5MB SPIFFS)\".");
+    }
+    if (phone->weather_valid) {
+        lv_obj_t *weather = add_text_at(page, &evb_font_regular_12, color::text_muted, "", left, 270);
+        lv_label_set_text_fmt(weather, "Outside temperature from open-meteo.com for %s: %d C", phone->weather_place, phone->weather_temp_c);
+    }
+}
+
+/* ---------- password keyboard ---------- */
+
+void close_password_keyboard(void)
+{
+    set_shown(menu.keyboard_layer, false);
+}
+
+void on_password_keyboard_event(lv_event_t *event)
+{
+    lv_event_code_t code = lv_event_get_code(event);
+    if (code == LV_EVENT_READY) {
+        evb_wifi_connect(menu.password_ssid, lv_textarea_get_text(menu.password_area));
+        close_password_keyboard();
+    } else if (code == LV_EVENT_CANCEL) {
+        close_password_keyboard();
+    }
+}
+
+void on_cancel_password_tapped(lv_event_t *event)
+{
+    LV_UNUSED(event);
+    close_password_keyboard();
+}
+
+void on_show_password_tapped(lv_event_t *event)
+{
+    LV_UNUSED(event);
+    lv_textarea_set_password_mode(menu.password_area, !lv_textarea_get_password_mode(menu.password_area));
+}
+
+void build_password_keyboard(lv_obj_t *parent)
+{
+    menu.keyboard_layer = add_full_screen_layer(parent);
+    lv_obj_t *layer = menu.keyboard_layer;
+    lv_obj_set_style_bg_color(layer, color::black, 0);
+    lv_obj_set_style_bg_opa(layer, 242, 0);
+    lv_obj_set_clickable(layer, true);
+
+    menu.password_title = add_text(layer, &evb_font_regular_18, color::text_primary, "");
+    place_by_top_center(menu.password_title, 400, 74);
+
+    menu.password_area = lv_textarea_create(layer);
+    lv_textarea_set_one_line(menu.password_area, true);
+    lv_textarea_set_password_mode(menu.password_area, true);
+    lv_textarea_set_max_length(menu.password_area, 64);
+    lv_textarea_set_placeholder_text(menu.password_area, "Password");
+    lv_obj_set_size(menu.password_area, 400, 44);
+    place_by_top_center(menu.password_area, 380, 104);
+    lv_obj_set_style_text_font(menu.password_area, &evb_font_regular_20, 0);
+    lv_obj_set_style_text_color(menu.password_area, color::text_primary, 0);
+    lv_obj_set_style_bg_color(menu.password_area, color::surface, 0);
+    lv_obj_set_style_border_color(menu.password_area, color::teal, 0);
+
+    add_small_button(layer, 595, 111, 70, "Show", on_show_password_tapped, NULL);
+    add_small_button(layer, 675, 111, 80, "Cancel", on_cancel_password_tapped, NULL);
+
+    lv_obj_t *keyboard = lv_keyboard_create(layer);
+    lv_obj_set_size(keyboard, 800, 240);
+    lv_obj_align(keyboard, LV_ALIGN_BOTTOM_MID, 0, 0);
+    lv_keyboard_set_textarea(keyboard, menu.password_area);
+    lv_obj_set_style_bg_color(keyboard, color::neutral18, 0);
+    lv_obj_set_style_bg_color(keyboard, color::surface_selected, LV_PART_ITEMS);
+    lv_obj_set_style_text_color(keyboard, color::text_primary, LV_PART_ITEMS);
+    lv_obj_set_style_border_width(keyboard, 0, LV_PART_ITEMS);
+    lv_obj_set_style_bg_color(keyboard, color::neutral3a, (lv_style_selector_t)LV_PART_ITEMS | (lv_style_selector_t)LV_STATE_CHECKED);
+    lv_obj_set_style_text_color(keyboard, color::text_primary, (lv_style_selector_t)LV_PART_ITEMS | (lv_style_selector_t)LV_STATE_CHECKED);
+    lv_obj_set_style_bg_color(keyboard, color::success_muted, (lv_style_selector_t)LV_PART_ITEMS | (lv_style_selector_t)LV_STATE_PRESSED);
+    lv_obj_add_event_cb(keyboard, on_password_keyboard_event, LV_EVENT_ALL, NULL);
+
+    set_shown(layer, false);
+}
+
+void open_password_keyboard(const char *ssid)
+{
+    evb_copy_text(menu.password_ssid, sizeof(menu.password_ssid), ssid);
+    lv_label_set_text_fmt(menu.password_title, "Password for %s", ssid);
+    lv_textarea_set_text(menu.password_area, "");
+    lv_textarea_set_password_mode(menu.password_area, true);
+    set_shown(menu.keyboard_layer, true);
 }
 
 /* ---------- Vitals ---------- */
@@ -851,7 +1208,7 @@ typedef void (*PageBuilder)(lv_obj_t *page);
 const PageBuilder PAGE_BUILDERS[MENU_PAGE_COUNT] = {
     build_profile_page, build_digilocker_page, build_seat_page, build_charging_page,
     build_bike_status_page, build_security_page, build_payment_page, build_customize_page,
-    build_misc_page, build_connectivity_page, build_vitals_page,
+    build_misc_page, build_connectivity_page, build_wifi_page, build_system_page, build_vitals_page,
 };
 
 int wrapped_page(int index)
@@ -890,6 +1247,11 @@ void move_menu(int step)
     rebuild_page();
     lv_obj_set_style_opa(menu.page, LV_OPA_TRANSP, 0);
     fade_to(menu.page, LV_OPA_COVER, 240);
+}
+
+void move_menu_to(int page_index)
+{
+    move_menu(wrapped_page(page_index - menu.page_index));
 }
 
 void on_carousel_tab_tapped(lv_event_t *event)
@@ -944,12 +1306,13 @@ void build_lock_hint(lv_obj_t *parent)
 
 } // namespace
 
-void evb_menu_create(lv_obj_t *parent, evb_cluster_settings_t *settings, evb_vehicle_state_t *vehicle)
+void evb_menu_create(lv_obj_t *parent, evb_cluster_settings_t *settings, evb_vehicle_state_t *vehicle, const PhoneState *phone)
 {
     menu = Menu();
     live = LiveLabels();
     menu.settings = settings;
     menu.vehicle = vehicle;
+    menu.phone = phone;
 
     menu.layer = add_full_screen_layer(parent);
     menu.page_host = add_plain_box(menu.layer, 0, 0, 800, CAROUSEL_TOP);
@@ -960,6 +1323,7 @@ void evb_menu_create(lv_obj_t *parent, evb_cluster_settings_t *settings, evb_veh
     set_shown(menu.layer, false);
 
     build_lock_hint(parent);
+    build_password_keyboard(parent);
 }
 
 void evb_menu_open(void)
@@ -977,6 +1341,7 @@ void evb_menu_open(void)
 
 void evb_menu_close(void)
 {
+    close_password_keyboard();
     menu.open = false;
     menu.sub_level = 0;
     if (menu.page != NULL) {
@@ -992,31 +1357,35 @@ bool evb_menu_is_open(void)
     return menu.open;
 }
 
-void evb_menu_refresh(uint32_t elapsed_ms)
+/* Pages that show phone or Wi-Fi data are drawn again when that data changes. */
+bool page_shows_phone_data(int page_index)
 {
+    return page_index == PAGE_MISC || page_index == PAGE_CONNECTIVITY || page_index == PAGE_WIFI || page_index == PAGE_SYSTEM;
+}
+
+void evb_menu_refresh(uint32_t elapsed_ms, uint32_t now_ms)
+{
+    menu.now_ms = now_ms;
     if (menu.lock_hint_left_ms > 0) {
         menu.lock_hint_left_ms = elapsed_ms >= menu.lock_hint_left_ms ? 0 : menu.lock_hint_left_ms - elapsed_ms;
         if (menu.lock_hint_left_ms == 0) {
             fade_to(menu.lock_hint, LV_OPA_TRANSP, 240);
         }
     }
-    if (menu.pairing) {
-        menu.pairing_elapsed_ms += elapsed_ms;
-        if (menu.pairing_elapsed_ms >= PAIRING_MS) {
-            menu.pairing = false;
-            menu.vehicle->phone_connected = true;
-        }
+    if (!menu.open) {
+        return;
     }
-    if (menu.settings->media_playing && menu.vehicle->phone_connected) {
-        menu.track_elapsed_ms += elapsed_ms;
-        if (menu.track_elapsed_ms >= 1000) {
-            menu.track_elapsed_ms -= 1000;
-            menu.settings->track_position_s = (menu.settings->track_position_s + 1) % TRACK_LENGTH_S;
-        }
+
+    menu.phone_rebuild_elapsed_ms += elapsed_ms;
+    if (page_shows_phone_data(menu.page_index) && menu.phone->revision != menu.shown_phone_revision
+        && menu.phone_rebuild_elapsed_ms >= PHONE_PAGE_REBUILD_MS) {
+        menu.phone_rebuild_elapsed_ms = 0;
+        menu.shown_phone_revision = menu.phone->revision;
+        rebuild_page();
     }
 
     menu.refresh_elapsed_ms += elapsed_ms;
-    if (!menu.open || menu.refresh_elapsed_ms < REFRESH_MS) {
+    if (menu.refresh_elapsed_ms < REFRESH_MS) {
         return;
     }
     menu.refresh_elapsed_ms = 0;
@@ -1024,10 +1393,7 @@ void evb_menu_refresh(uint32_t elapsed_ms)
         refresh_charging_page();
     }
     if (live.music_knob != NULL) {
-        refresh_music_knob();
-    }
-    if (live.connection_status != NULL) {
-        refresh_connectivity_page();
+        refresh_music_progress();
     }
     if (live.vitals_power != NULL) {
         refresh_vitals_page();
