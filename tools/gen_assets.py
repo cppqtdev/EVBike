@@ -1,160 +1,324 @@
-"""Builds the LVGL image and font C files for the EVBikes ride screen (800x480).
+"""Builds the LVGL asset and font C files for the EVBikes cluster (800x480).
 
 Run from this tools folder (needs Python 3 with pillow and numpy):
     EVB_ASSETS=/Users/adesh/EVBikes/assets python3 gen_assets.py
 The C files are written to the sketch folder (one level up).
+
+Pictures are stored zlib-compressed in flash and unpacked into PSRAM the first
+time a screen needs them (see evb_assets.cpp), so the whole cluster fits the
+3 MB app partition.
 """
-from PIL import Image, ImageFont
-import numpy as np, os
-from compose import A, shell, hexc
+from PIL import Image, ImageDraw, ImageFont
+import numpy as np
+import os
+import zlib
+
+from compose import A, hexc, shell
 from layout import X0, SX
-OUT=os.environ.get('EVB_OUT', '..')
-F=A+'fonts/'
+
+OUT = os.environ.get('EVB_OUT', '..')
+F = A + 'fonts/'
+
 
 def c_bytes(b):
-    lines=[]
-    for i in range(0,len(b),24):
-        lines.append('    '+', '.join(f'0x{v:02x}' for v in b[i:i+24])+',')
+    lines = []
+    for i in range(0, len(b), 24):
+        lines.append('    ' + ', '.join(f'0x{v:02x}' for v in b[i:i + 24]) + ',')
     return '\n'.join(lines)
 
-def alpha_of(path, width=None):
-    im=Image.open(A+path).convert('RGBA')
-    a=im.split()[3]
-    if width: a=a.resize((width,im.height),Image.LANCZOS)
-    return np.array(a,np.uint8)
 
-def squashed_width(path): return max(1,round(Image.open(A+path).width*SX))
+# ---------- picture helpers ----------
+
+def rgba_of(path, size=None):
+    im = Image.open(A + path).convert('RGBA')
+    if size and im.size != size:
+        im = im.resize(size, Image.LANCZOS)
+    return im
+
+
+def alpha_of(path, width=None, size=None):
+    im = rgba_of(path, size)
+    a = im.split()[3]
+    if width:
+        a = a.resize((width, im.height), Image.LANCZOS)
+    return np.array(a, np.uint8)
+
+
+def squashed_width(path):
+    return max(1, round(Image.open(A + path).width * SX))
+
 
 def dither_rgb565(rgb):
-    bayer=np.array([[0,8,2,10],[12,4,14,6],[3,11,1,9],[15,7,13,5]],np.float32)/16-0.5
-    h,w,_=rgb.shape
-    t=np.tile(bayer,(h//4+1,w//4+1))[:h,:w]
-    r=np.clip(np.round(rgb[...,0]/255*31+t),0,31).astype(np.uint16)
-    g=np.clip(np.round(rgb[...,1]/255*63+t),0,63).astype(np.uint16)
-    b=np.clip(np.round(rgb[...,2]/255*31+t),0,31).astype(np.uint16)
-    return (r<<11)|(g<<5)|b
+    bayer = np.array([[0, 8, 2, 10], [12, 4, 14, 6], [3, 11, 1, 9], [15, 7, 13, 5]], np.float32) / 16 - 0.5
+    h, w, _ = rgb.shape
+    t = np.tile(bayer, (h // 4 + 1, w // 4 + 1))[:h, :w]
+    r = np.clip(np.round(rgb[..., 0] / 255 * 31 + t), 0, 31).astype(np.uint16)
+    g = np.clip(np.round(rgb[..., 1] / 255 * 63 + t), 0, 63).astype(np.uint16)
+    b = np.clip(np.round(rgb[..., 2] / 255 * 31 + t), 0, 31).astype(np.uint16)
+    return (r << 11) | (g << 5) | b
 
-class ImageFile:
-    def __init__(self,name): self.name=name; self.parts=[]; self.decls=[]
-    def add(self,sym,cf,w,h,stride,data):
-        self.parts.append(f'''static LV_ATTRIBUTE_LARGE_CONST const uint8_t {sym}_map[] = {{
-{c_bytes(data)}
-}};
 
-const lv_image_dsc_t {sym} = {{
-    .header = {{
-        .magic = LV_IMAGE_HEADER_MAGIC,
-        .cf = {cf},
-        .flags = 0,
-        .w = {w},
-        .h = {h},
-        .stride = {stride},
-    }},
-    .data_size = sizeof({sym}_map),
-    .data = {sym}_map,
-}};
-''')
-        self.decls.append(f'extern const lv_image_dsc_t {sym}; /* {w}x{h} */')
-    def a8(self,sym,a): h,w=a.shape; self.add(sym,'LV_COLOR_FORMAT_A8',w,h,w,a.tobytes())
-    def rgb565(self,sym,rgb):
-        h,w,_=rgb.shape; px=dither_rgb565(rgb.astype(np.float32))
-        self.add(sym,'LV_COLOR_FORMAT_RGB565',w,h,w*2,px.astype('<u2').tobytes())
-    def rgb565a8(self,sym,rgb,alpha):
-        h,w,_=rgb.shape; px=dither_rgb565(rgb.astype(np.float32))
-        self.add(sym,'LV_COLOR_FORMAT_RGB565A8',w,h,w*2,px.astype('<u2').tobytes()+alpha.astype(np.uint8).tobytes())
-    def write(self):
-        with open(f'{OUT}/{self.name}.c','w') as f:
-            f.write('/* Generated from the EVBikes design art. Do not edit by hand. */\n#include "evb_images.h"\n\n'+'\n'.join(self.parts))
-        return self.decls
+def fade_profile(width, edge=0.3):
+    t = np.linspace(0, 1, width)
+    return np.clip(np.minimum(t / edge, (1 - t) / edge), 0, 1)
+
 
 def gradient_fill(alpha, start, end, ramp_from=0.0):
-    h,w=alpha.shape; t=np.clip((np.arange(w)/(w-1)-ramp_from)/(1-ramp_from),0,1)
-    s=np.array(hexc(start),np.float32); e=np.array(hexc(end),np.float32)
-    row=s[None,:]+(e-s)[None,:]*t[:,None]
-    return np.repeat(row[None,:,:],h,axis=0)
+    h, w = alpha.shape
+    t = np.clip((np.arange(w) / (w - 1) - ramp_from) / (1 - ramp_from), 0, 1)
+    s = np.array(hexc(start), np.float32)
+    e = np.array(hexc(end), np.float32)
+    row = s[None, :] + (e - s)[None, :] * t[:, None]
+    return np.repeat(row[None, :, :], h, axis=0)
 
-def build_images():
-    decls=[]
-    for mode in ('eco','sport'):
-        c=shell(mode)[:,X0:X0+1152]
-        bg=np.array(Image.fromarray(c.clip(0,255).astype(np.uint8)).resize((800,480),Image.LANCZOS))
-        f=ImageFile(f'evb_bg_{mode}'); f.rgb565(f'evb_img_shell_{mode}',bg); decls+=f.write()
-    f=ImageFile('evb_images')
-    for side in 'lr':
+
+class AssetTable:
+    def __init__(self):
+        self.entries = []
+
+    def add(self, name, cf, w, h, stride, raw):
+        self.entries.append((name, cf, w, h, stride, raw))
+
+    def a8(self, name, a):
+        h, w = a.shape
+        self.add(name, 'LV_COLOR_FORMAT_A8', w, h, w, a.astype(np.uint8).tobytes())
+
+    def rgb565(self, name, rgb):
+        h, w, _ = rgb.shape
+        px = dither_rgb565(rgb.astype(np.float32))
+        self.add(name, 'LV_COLOR_FORMAT_RGB565', w, h, w * 2, px.astype('<u2').tobytes())
+
+    def rgb565a8(self, name, rgb, alpha):
+        h, w, _ = rgb.shape
+        px = dither_rgb565(rgb.astype(np.float32))
+        self.add(name, 'LV_COLOR_FORMAT_RGB565A8', w, h, w * 2,
+                 px.astype('<u2').tobytes() + alpha.astype(np.uint8).tobytes())
+
+    def picture(self, name, im):
+        a = np.array(im.convert('RGBA'))
+        self.rgb565a8(name, a[..., :3], a[..., 3])
+
+    def write(self):
+        ids = []
+        data = []
+        rows = []
+        raw_total = 0
+        packed_total = 0
+        for name, cf, w, h, stride, raw in self.entries:
+            packed = zlib.compress(raw, 9)
+            raw_total += len(raw)
+            packed_total += len(packed)
+            sym = 'evb_asset_' + name.lower()
+            ids.append(f'    EVB_ASSET_{name},')
+            data.append(f'static const uint8_t {sym}_z[] = {{\n{c_bytes(packed)}\n}};\n')
+            rows.append(f'    {{{cf}, {w}, {h}, {stride}, {len(raw)}, {sym}_z, sizeof({sym}_z)}}, /* {name} */')
+        with open(f'{OUT}/evb_asset_ids.h', 'w') as f:
+            f.write('/* Generated by tools/gen_assets.py. Do not edit by hand. */\n#pragma once\n\n'
+                    'typedef enum {\n' + '\n'.join(ids) + '\n    EVB_ASSET_COUNT,\n} evb_asset_id_t;\n')
+        with open(f'{OUT}/evb_asset_data.c', 'w') as f:
+            f.write('/* Generated by tools/gen_assets.py. Do not edit by hand.\n'
+                    f' * {len(self.entries)} pictures, {raw_total} bytes unpacked, {packed_total} bytes in flash. */\n'
+                    '#include "evb_asset_data.h"\n\n' + '\n'.join(data) +
+                    '\nconst evb_packed_asset_t evb_packed_assets[EVB_ASSET_COUNT] = {\n' + '\n'.join(rows) + '\n};\n')
+        print(f'{len(self.entries)} pictures: {raw_total} bytes unpacked, {packed_total} bytes in flash')
+
+
+# ---------- the pictures ----------
+
+def font(name, px):
+    return ImageFont.truetype(F + name, px)
+
+
+def draw_tinted(canvas, path, x, y, color, size=None, angle=0.0):
+    im = rgba_of(path, size)
+    if angle:
+        im = im.rotate(-angle, resample=Image.BICUBIC)
+    layer = Image.new('RGBA', im.size, hexc(color) + (0,))
+    layer.putalpha(im.split()[3])
+    canvas.alpha_composite(layer, (x, y))
+
+
+def shortcut_keys_picture():
+    """Customize > Shortcut keys, drawn like CustomizePage.qml, scaled to fit 800 wide."""
+    left, top = 343, 148
+    c = Image.new('RGBA', (944 - left + 2, 280 - top), (0, 0, 0, 0))
+    d = ImageDraw.Draw(c)
+
+    def rect(x, y, w, h, color, r=0):
+        d.rounded_rectangle((x - left, y - top, x - left + w - 1, y - top + h - 1), r, fill=hexc(color) + (255,))
+
+    def icon(path, x, y, color, size=None, angle=0.0):
+        draw_tinted(c, path, x - left, y - top, color, size, angle)
+
+    def text(x, y, s, px, color, anchor='la'):
+        d.text((x - left, y - top), s, font=font('Inter-Regular.ttf', px), fill=hexc(color) + (255,), anchor=anchor)
+
+    rect(343, 158, 42, 108, '#2D2D2D', 3)
+    icon('icons/24/low_beam.png', 352, 162, '#C3C8CA')
+    rect(343, 194, 42, 36, '#3E3E3E')
+    text(364, 202, 'ATO', 16, '#DEDEDE', 'ma')
+    icon('icons/24/high_beam.png', 352, 238, '#C3C8CA')
+
+    icon('cluster/card_tilt.png', 425, 148, '#2D2D2D', angle=-8)
+    icon('icons/26/chevron.png', 462, 176, '#C3C8CA')
+    icon('icons/26/back.png', 452, 206, '#C3C8CA')
+    text(500, 170, '- - - - - - - - - -', 14, '#C3C8CA')
+    text(496, 206, '- - - - - - - - - -', 14, '#C3C8CA')
+
+    icon('cluster/card_tilt.png', 662, 148, '#2D2D2D', angle=8)
+    text(692, 160, 'S', 14, '#DEDEDE')
+    text(732, 168, 'N', 14, '#DEDEDE')
+    text(768, 176, 'E', 14, '#DEDEDE')
+    icon('icons/18/back.png', 688, 192, '#DEDEDE')
+    text(727, 190, '+', 26, '#DEDEDE')
+    icon('icons/20/play.png', 764, 206, '#DEDEDE')
+    icon('icons/18/wrench.png', 796, 180, '#DEDEDE')
+    icon('icons/18/grid_plus.png', 798, 210, '#DEDEDE')
+
+    rect(902, 158, 42, 108, '#2D2D2D', 3)
+    icon('icons/24/joystick.png', 911, 162, '#8C9194')
+    rect(902, 194, 42, 42, '#3E3E3E')
+    icon('icons/26/power.png', 910, 199, '#DEDEDE')
+    text(923, 240, 'C', 18, '#8C9194', 'ma')
+
+    rect(620, 252, 48, 26, '#2D2D2D', 3)
+    icon('icons/20/back_curve.png', 634, 255, '#DEDEDE')
+
+    scale = 0.78
+    return c.resize((round(c.width * scale), round(c.height * scale)), Image.LANCZOS)
+
+
+def build_pictures(t):
+    for look in ('boot', 'preride_ready', 'preride_stand', 'ride_eco', 'ride_sport'):
+        c = shell(look)[:, X0:X0 + 1152]
+        bg = np.array(Image.fromarray(c.clip(0, 255).astype(np.uint8)).resize((800, 480), Image.LANCZOS))
+        t.rgb565(f'SHELL_{look.upper()}', bg)
+    p = 'cluster/trimmed/floor_glow.png'
+    t.a8('FLOOR_GLOW', alpha_of(p, squashed_width(p)))
+
+    # Ride screen
+    for side in 'LR':
         for i in range(8):
-            p=f'cluster/seg_{side}{i}.png'; f.a8(f'evb_img_seg_{side}{i}',alpha_of(p,squashed_width(p)))
-    # Speed digits share one crop so every cell lines up.
-    x0,y0,x1,y1=39,29,139,151
-    for d in [str(i) for i in range(10)]+['dash']:
-        f.a8(f'evb_img_speed_{d}',alpha_of(f'design/speed_{d}.png')[y0:y1,x0:x1])
-        f.a8(f'evb_img_speed_foot_{d}',alpha_of(f'design/speed_foot_{d}.png')[y0:y1,x0:x1])
-    f.a8('evb_img_speed_unit_kph',alpha_of('design/speed_unit_kph.png'))
-    f.a8('evb_img_orbit',alpha_of('cluster/orbit.png',200))
-    f.a8('evb_img_glow_spot',alpha_of('images/glow_blob_150x40.png'))
-    f.a8('evb_img_mode_glow',alpha_of('images/glow_blob_140x64.png'))
-    f.a8('evb_img_mode_chip',alpha_of('cluster/chip.png'))
-    bike=np.array(Image.open(A+'cluster/bike_180.png').convert('RGBA'))
-    f.rgb565a8('evb_img_bike',bike[...,:3],bike[...,3])
-    tw=140
-    left=alpha_of('cluster/bar_pointed_left.png',tw); right=alpha_of('cluster/bar_pointed_right.png',tw)
-    f.a8('evb_img_battery_track',left)
-    f.a8('evb_img_temp_track',right)
-    f.rgb565a8('evb_img_battery_fill',gradient_fill(left,'#904229','#969683'),left)
-    f.rgb565a8('evb_img_battery_fill_low',gradient_fill(left,'#B01E2E','#E0A0A6'),left)
-    f.rgb565a8('evb_img_temp_fill',gradient_fill(right,'#91C0A9','#8F432B',108/194),right)
-    f.a8('evb_img_temp_ruler',alpha_of('cluster/ruler.png',tw))
-    t=np.linspace(0,1,280); fade=np.clip(np.minimum(t/0.3,(1-t)/0.3),0,1)
-    f.a8('evb_img_fade_line',(fade*255+0.5).astype(np.uint8)[None,:])
-    for n in ('left','high_beam','low_beam','warning','abs','battery','right'):
-        f.a8(f'evb_img_tt_{n}',alpha_of(f'design/tt_{n}.png'))
-    for sym,p in (('bluetooth','icons/28/bluetooth.png'),('signal','icons/22/signal_full.png'),('battery_bolt','icons/26/battery_bolt.png'),
-                  ('thermo','icons/28/thermo.png'),('compass','icons/36/compass.png'),('bell','icons/24/bell.png'),
-                  ('mute','icons/24/mute.png'),('settings','icons/24/settings.png')):
-        f.a8(f'evb_img_icon_{sym}',alpha_of(p))
-    decls+=f.write()
-    with open(f'{OUT}/evb_images.h','w') as h:
-        h.write('/* Generated from the EVBikes design art. Do not edit by hand. */\n#pragma once\n\n#include <lvgl.h>\n\n#ifdef __cplusplus\nextern "C" {\n#endif\n\n'
-                +'\n'.join(decls)+'\n\n#ifdef __cplusplus\n}\n#endif\n')
+            p = f'cluster/seg_{side.lower()}{i}.png'
+            t.a8(f'SEG_{side}{i}', alpha_of(p, squashed_width(p)))
+    x0, y0, x1, y1 = 39, 29, 139, 151
+    for d in [str(i) for i in range(10)] + ['dash']:
+        t.a8(f'SPEED_{d.upper()}', alpha_of(f'design/speed_{d}.png')[y0:y1, x0:x1])
+        t.a8(f'SPEED_FOOT_{d.upper()}', alpha_of(f'design/speed_foot_{d}.png')[y0:y1, x0:x1])
+    t.a8('SPEED_UNIT_KPH', alpha_of('design/speed_unit_kph.png'))
+    t.a8('SPEED_UNIT_MPH', alpha_of('design/speed_unit_mph.png'))
+    t.a8('ORBIT', alpha_of('cluster/orbit.png', 200))
+    t.a8('GLOW_SPOT', alpha_of('images/glow_blob_150x40.png'))
+    t.a8('MODE_GLOW', alpha_of('images/glow_blob_140x64.png'))
+    t.a8('MODE_CHIP', alpha_of('cluster/chip.png'))
+    t.picture('BIKE', rgba_of('cluster/bike_180.png'))
+    tw = 140
+    left = alpha_of('cluster/bar_pointed_left.png', tw)
+    right = alpha_of('cluster/bar_pointed_right.png', tw)
+    t.a8('BATTERY_TRACK', left)
+    t.a8('TEMP_TRACK', right)
+    t.rgb565a8('BATTERY_FILL', gradient_fill(left, '#904229', '#969683'), left)
+    t.rgb565a8('BATTERY_FILL_LOW', gradient_fill(left, '#B01E2E', '#E0A0A6'), left)
+    t.rgb565a8('TEMP_FILL', gradient_fill(right, '#91C0A9', '#8F432B', 108 / 194), right)
+    t.a8('TEMP_RULER', alpha_of('cluster/ruler.png', tw))
+    t.a8('FADE_LINE', (fade_profile(280) * 255 + 0.5).astype(np.uint8)[None, :])
+    for n in ('left', 'high_beam', 'low_beam', 'warning', 'abs', 'battery', 'right'):
+        t.a8(f'TT_{n.upper()}', alpha_of(f'design/tt_{n}.png'))
+    for name, p in (('BLUETOOTH', 'icons/28/bluetooth.png'), ('SIGNAL', 'icons/22/signal_full.png'),
+                    ('BATTERY_BOLT', 'icons/26/battery_bolt.png'), ('THERMO', 'icons/28/thermo.png'),
+                    ('COMPASS', 'icons/36/compass.png'), ('BELL', 'icons/24/bell.png'),
+                    ('MUTE', 'icons/24/mute.png'), ('SETTINGS', 'icons/24/settings.png')):
+        t.a8(f'ICON_{name}', alpha_of(p))
+    t.a8('DOCK_BAND', alpha_of('cluster/band_right.png'))
+    t.a8('DOCK_BAND_LIP', alpha_of('cluster/band_right_lip.png'))
 
-FONTS=[  # symbol, ttf, px, characters
- ('evb_font_label_12','Inter-BoldItalic.ttf',12,'MAXAMPRPM×0123456789 '),
- ('evb_font_label_16','Inter-BoldItalic.ttf',16,'RANGEOD '),
- ('evb_font_label_19','Inter-BoldItalic.ttf',19,'TRIPSOR '),
- ('evb_font_mode_26','Inter-BoldItalic.ttf',26,'ECO'),
- ('evb_font_value_30','Inter-BoldItalic.ttf',30,'0123456789-'),
- ('evb_font_italic_14','Inter-Italic.ttf',14,'0123456789-%'),
- ('evb_font_italic_16','Inter-Italic.ttf',16,'0123456789-°ckm'),
- ('evb_font_italic_18','Inter-Italic.ttf',18,'0123456789-'),
- ('evb_font_regular_15','Inter-Regular.ttf',15,'CF'),
- ('evb_font_regular_16','Inter-Regular.ttf',16,'apm'),
- ('evb_font_regular_18','Inter-Regular.ttf',18,'RPND°'),
- ('evb_font_regular_22','Inter-Regular.ttf',22,'0123456789:-'),
- ('evb_font_regular_24','Inter-Regular.ttf',24,'0123456789-'),
- ('evb_font_regular_26','Inter-Regular.ttf',26,'RPND'),
-]
+    # Splash, unlock and pre-ride
+    for i in range(8):
+        t.a8(f'FRONT_LINE_{i}', alpha_of(f'cluster/front_line_{i}.png'))
+    t.a8('FRONT_HEADLIGHT', alpha_of('cluster/front_headlight.png'))
+    t.a8('FINGERPRINT_DISC', alpha_of('cluster/fingerprint_disc.png'))
+    t.a8('FINGERPRINT', alpha_of('cluster/fingerprint.png'))
+    p = 'cluster/progress_glow.png'
+    t.a8('PROGRESS_GLOW', alpha_of(p, squashed_width(p)))
+    t.a8('AVATAR_LARGE', alpha_of('cluster/avatar_106.png'))
+    t.a8('AVATAR_SMALL', alpha_of('cluster/avatar_92.png'))
+    t.a8('ICON_TRIANGLE_32', alpha_of('icons/32/triangle.png'))
+    t.a8('ICON_CHECK_32', alpha_of('icons/32/check.png'))
+    t.a8('ICON_BLUETOOTH_30', alpha_of('icons/34/bluetooth.png', size=(30, 30)))
+    t.a8('ICON_HELMET_30', alpha_of('icons/34/helmet.png', size=(30, 30)))
+    t.a8('ICON_WATCH_30', alpha_of('icons/34/watch.png', size=(30, 30)))
+    t.a8('ICON_TRIANGLE_24', alpha_of('icons/24/triangle.png'))
+    t.a8('GLOW_BLOB_80', alpha_of('images/glow_blob_80x80.png'))
+    t.a8('CALLOUT', alpha_of('cluster/callout.png'))
+    t.a8('GLOW_BAND', np.repeat((fade_profile(320, 0.5) * 255 + 0.5).astype(np.uint8)[None, :], 26, axis=0))
+
+    # Menu pages
+    chevron = rgba_of('icons/18/chevron.png')
+    t.a8('ICON_CHEVRON_RIGHT', np.array(chevron.split()[3]))
+    t.a8('ICON_CHEVRON_LEFT', np.array(chevron.transpose(Image.FLIP_LEFT_RIGHT).split()[3]))
+    t.picture('SEAT', rgba_of('cluster/seat.png'))
+    nav = rgba_of('icons/20/nav.png')
+    t.a8('ICON_ARROW_UP', np.array(nav.split()[3]))
+    t.a8('ICON_ARROW_DOWN', np.array(nav.rotate(180).split()[3]))
+    t.a8('GLOW_BLOB_320', alpha_of('images/glow_blob_320x200.png'))
+    t.a8('GLOW_BLOB_260', alpha_of('images/glow_blob_260x120.png'))
+    plug = rgba_of('icons/28/plug.png', (24, 24)).rotate(-35, resample=Image.BICUBIC)
+    t.a8('ICON_PLUG', np.array(plug.split()[3]))
+    t.a8('SHIELD', alpha_of('cluster/shield.png'))
+    t.picture('PAYMENT_CARD', rgba_of('cluster/payment_card.png'))
+    t.picture('SHORTCUT_KEYS', shortcut_keys_picture())
+    for name, p in (('SUN', 'icons/24/sun.png'), ('CLOCK', 'icons/24/clock.png'), ('COMPASS_24', 'icons/24/compass.png'),
+                    ('INFO', 'icons/24/info.png'), ('PREV', 'icons/18/prev.png'), ('NEXT', 'icons/18/next.png'),
+                    ('PLAY', 'icons/18/play.png'), ('PAUSE', 'icons/18/pause.png'),
+                    ('ROUTE_LOOP', 'icons/36/route_loop.png'), ('FUEL_CAN', 'icons/36/fuel_can.png'),
+                    ('SPROUT', 'icons/36/sprout.png'), ('CLOUD', 'icons/36/cloud.png'),
+                    ('BACK_CURVE', 'icons/28/back_curve.png')):
+        t.a8(f'ICON_{name}', alpha_of(p))
+    t.picture('ALBUM_ART', rgba_of('cluster/album_art.png'))
+
+
+# ---------- fonts ----------
+
+TEXT_CHARS = ''.join(chr(c) for c in range(0x20, 0x7F)) + '°✓×↑↓←→·›'
+FONT_SIZES = {
+    'regular': ('Inter-Regular.ttf', [10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 22, 24, 26, 30, 34]),
+    'italic': ('Inter-Italic.ttf', [11, 14, 15, 16, 18, 22]),
+    'bold': ('Inter-Bold.ttf', [10, 13, 14, 16, 17, 18, 20, 24, 30]),
+    'bold_italic': ('Inter-BoldItalic.ttf', [12, 16, 19, 20, 22, 26, 30]),
+}
+EXTRA_FONTS = [('evb_font_logo_64', 'Inter-Regular.ttf', 64, 'EVBIKS')]
+
 
 def build_font(sym, ttf, px, chars):
-    font=ImageFont.truetype(F+ttf,px)
-    ascent,descent=font.getmetrics()
-    chars=sorted(set(chars))
-    bitmap=bytearray(); glyphs=['    {.bitmap_index = 0, .adv_w = 0, .box_w = 0, .box_h = 0, .ofs_x = 0, .ofs_y = 0} /* id = 0 reserved */,']
+    fnt = ImageFont.truetype(F + ttf, px)
+    ascent, descent = fnt.getmetrics()
+    chars = sorted(set(chars))
+    bitmap = bytearray()
+    glyphs = ['    {.bitmap_index = 0, .adv_w = 0, .box_w = 0, .box_h = 0, .ofs_x = 0, .ofs_y = 0} /* id = 0 reserved */,']
     for ch in chars:
-        adv=round(font.getlength(ch)*16)
-        mask,(ox,oy)=font.getmask2(ch,mode='L')
-        a=np.array(mask,np.uint8).reshape(mask.size[1],mask.size[0]) if mask.size[0]*mask.size[1] else np.zeros((0,0),np.uint8)
+        adv = round(fnt.getlength(ch) * 16)
+        m, (ox, oy) = fnt.getmask2(ch, mode='L')
+        a = np.array(m, np.uint8).reshape(m.size[1], m.size[0]) if m.size[0] * m.size[1] else np.zeros((0, 0), np.uint8)
         if a.size and a.any():
-            ys,xs=np.nonzero(a); a=a[ys.min():ys.max()+1,xs.min():xs.max()+1]; ox+=xs.min(); oy+=ys.min()
-            h,w=a.shape
-            q=((a.astype(np.int32)*15+127)//255).flatten()
-            if len(q)%2: q=np.append(q,0)
-            start=len(bitmap); bitmap+=bytes(((q[0::2]<<4)|q[1::2]).astype(np.uint8))
-            ofs_y=ascent-(oy+h)
-            glyphs.append(f'    {{.bitmap_index = {start}, .adv_w = {adv}, .box_w = {w}, .box_h = {h}, .ofs_x = {ox}, .ofs_y = {ofs_y}}}, /* {ch!r} */')
+            ys, xs = np.nonzero(a)
+            a = a[ys.min():ys.max() + 1, xs.min():xs.max() + 1]
+            ox += xs.min()
+            oy += ys.min()
+            h, w = a.shape
+            q = ((a.astype(np.int32) * 15 + 127) // 255).flatten()
+            if len(q) % 2:
+                q = np.append(q, 0)
+            start = len(bitmap)
+            bitmap += bytes(((q[0::2] << 4) | q[1::2]).astype(np.uint8))
+            glyphs.append(f'    {{.bitmap_index = {start}, .adv_w = {adv}, .box_w = {w}, .box_h = {h}, '
+                          f'.ofs_x = {ox}, .ofs_y = {ascent - (oy + h)}}},')
         else:
-            glyphs.append(f'    {{.bitmap_index = {len(bitmap)}, .adv_w = {adv}, .box_w = 0, .box_h = 0, .ofs_x = 0, .ofs_y = 0}}, /* {ch!r} */')
-    first=ord(chars[0]); offsets=[ord(c)-first for c in chars]
-    cap=font.getbbox('H',anchor='ls'); xh=font.getbbox('x',anchor='ls')
-    return f'''/* {sym}: {ttf} {px}px, characters "{''.join(chars)}". Generated, do not edit by hand. */
+            glyphs.append(f'    {{.bitmap_index = {len(bitmap)}, .adv_w = {adv}, .box_w = 0, .box_h = 0, .ofs_x = 0, .ofs_y = 0}},')
+    first = ord(chars[0])
+    offsets = [ord(c) - first for c in chars]
+    cap = fnt.getbbox('H', anchor='ls')
+    xh = fnt.getbbox('x', anchor='ls')
+    return f'''/* {sym}: {ttf} {px}px */
 static LV_ATTRIBUTE_LARGE_CONST const uint8_t {sym}_bitmap[] = {{
 {c_bytes(bitmap) if bitmap else '    0x00,'}
 }};
@@ -170,7 +334,7 @@ static const uint16_t {sym}_unicode_list[] = {{
 static const lv_font_fmt_txt_cmap_t {sym}_cmaps[] = {{
     {{
         .range_start = {first},
-        .range_length = {offsets[-1]+1},
+        .range_length = {offsets[-1] + 1},
         .glyph_id_start = 1,
         .unicode_list = {sym}_unicode_list,
         .glyph_id_ofs_list = NULL,
@@ -194,7 +358,7 @@ static const lv_font_fmt_txt_dsc_t {sym}_dsc = {{
 const lv_font_t {sym} = {{
     .get_glyph_dsc = lv_font_get_glyph_dsc_fmt_txt,
     .get_glyph_bitmap = lv_font_get_bitmap_fmt_txt,
-    .line_height = {ascent+descent},
+    .line_height = {ascent + descent},
     .base_line = {descent},
 #if LV_VERSION_CHECK(9, 6, 0) || LVGL_VERSION_MAJOR >= 10
     .cap_height = {-cap[1]},
@@ -212,13 +376,29 @@ const lv_font_t {sym} = {{
 }};
 '''
 
-def build_fonts():
-    body=['/* Inter glyphs used by the EVBikes ride screen. Generated, do not edit by hand. */\n#include "evb_fonts.h"\n']
-    decls=[]
-    for sym,ttf,px,chars in FONTS:
-        body.append(build_font(sym,ttf,px,chars)); decls.append(f'extern const lv_font_t {sym};')
-    open(f'{OUT}/evb_fonts.c','w').write('\n'.join(body))
-    open(f'{OUT}/evb_fonts.h','w').write('/* Inter glyphs used by the EVBikes ride screen. Generated, do not edit by hand. */\n#pragma once\n\n#include <lvgl.h>\n\n#ifdef __cplusplus\nextern "C" {\n#endif\n\n'+'\n'.join(decls)+'\n\n#ifdef __cplusplus\n}\n#endif\n')
 
-if __name__=='__main__':
-    os.makedirs(OUT,exist_ok=True); build_images(); build_fonts(); print('done')
+def build_fonts():
+    specs = []
+    for style, (ttf, sizes) in FONT_SIZES.items():
+        for px in sizes:
+            specs.append((f'evb_font_{style}_{px}', ttf, px, TEXT_CHARS))
+    specs += EXTRA_FONTS
+    body = ['/* Inter glyphs used by the EVBikes cluster. Generated by tools/gen_assets.py, do not edit by hand. */\n'
+            '#include "evb_fonts.h"\n']
+    decls = []
+    for sym, ttf, px, chars in specs:
+        body.append(build_font(sym, ttf, px, chars))
+        decls.append(f'extern const lv_font_t {sym};')
+    open(f'{OUT}/evb_fonts.c', 'w').write('\n'.join(body))
+    open(f'{OUT}/evb_fonts.h', 'w').write(
+        '/* Inter glyphs used by the EVBikes cluster. Generated by tools/gen_assets.py, do not edit by hand. */\n'
+        '#pragma once\n\n#include <lvgl.h>\n\n#ifdef __cplusplus\nextern "C" {\n#endif\n\n'
+        + '\n'.join(decls) + '\n\n#ifdef __cplusplus\n}\n#endif\n')
+
+
+if __name__ == '__main__':
+    os.makedirs(OUT, exist_ok=True)
+    table = AssetTable()
+    build_pictures(table)
+    table.write()
+    build_fonts()

@@ -3,7 +3,7 @@
 #include <esp_err.h>
 
 #include <lvgl.h>
-#include "evb_ride_simulator.h"
+#include "evb_cluster_app.h"
 
 #include "esp_lv_adapter_arduino.h"
 
@@ -13,7 +13,7 @@ using namespace esp_panel::board;
 void setup()
 {
     Serial.begin(115200);
-    Serial.println("EVBikes ride screen start");
+    Serial.println("EVBikes cluster start");
 
     Board *board = new Board();
     if ((board == nullptr) || !board->init()) {
@@ -65,10 +65,10 @@ void setup()
     ESP_ERROR_CHECK(esp_lv_adapter_start());
 
     ESP_ERROR_CHECK(esp_lv_adapter_lock(-1));
-    evb_ride_simulator_start();
+    evb_cluster_app_start();
     esp_lv_adapter_unlock();
 
-    Serial.println("EVBikes ride screen ready");
+    Serial.println("EVBikes cluster ready");
 }
 
 void loop()

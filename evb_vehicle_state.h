@@ -25,6 +25,9 @@ typedef struct {
     int odometer_km;
     int trip_km;
     int ambient_temp_c;
+    int tyre_front_psi_x10;
+    int tyre_rear_psi_x10;
+    int fault_code;
     int clock_hours;
     int clock_minutes;
     evb_gear_t gear;
@@ -35,6 +38,8 @@ typedef struct {
     bool low_beam_on;
     bool vehicle_warning_on;
     bool abs_fault_on;
+    bool side_stand_down;
+    bool charger_plugged;
     bool phone_connected;
     bool alerts_muted;
 } evb_vehicle_state_t;
